@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""Propose sequential experiments for a noisy 2-D binary transition contour."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import random
+import statistics
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+PROPOSAL_COLUMNS = [
+    "caseId",
+    "x",
+    "y",
+    "id",
+    "proposal_type",
+    "score",
+    "p_positive_pred",
+    "y_c_pred",
+    "y_c_q05",
+    "y_c_q95",
+    "y_c_std",
+    "n_existing",
+    "k_existing",
+    "reason",
+]
+LEGACY_COLUMNS = ["caseId", "x", "y", "id"]
+
+
+@dataclass(frozen=True)
+class Observation:
+    case_id: str
+    x: float
+    y: float
+    label: int
+
+
+@dataclass(frozen=True)
+class AggregatePoint:
+    x: float
+    y: float
+    n: int
+    k: int
+
+    @property
+    def rate(self) -> float:
+        return self.k / self.n
+
+
+@dataclass(frozen=True)
+class Domain:
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+
+    @property
+    def x_span(self) -> float:
+        return self.x_max - self.x_min
+
+    @property
+    def y_span(self) -> float:
+        return self.y_max - self.y_min
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    mode: str
+    monotone_direction: str
+    y_scale: str
+    transition_width: float
+    label_noise: float
+    length_scale_x: float
+    length_scale_y: float
+    prior_alpha: float
+    prior_beta: float
+    grid_size: int
+    posterior_samples: int
+
+
+@dataclass(frozen=True)
+class ContourEstimate:
+    y_c_pred: float
+    y_c_q05: float
+    y_c_q95: float
+    y_c_std: float
+
+
+@dataclass(frozen=True)
+class Proposal:
+    x: float
+    y: float
+    proposal_type: str
+    score: float
+    p_positive_pred: float
+    contour: ContourEstimate
+    n_existing: int
+    k_existing: int
+    reason: str
+
+
+def read_csv_files(
+    paths: Sequence[Path],
+    *,
+    case_col: str,
+    x_col: str,
+    y_col: str,
+    label_col: str,
+) -> tuple[list[Observation], list[str]]:
+    observations: list[Observation] = []
+    all_case_ids: list[str] = []
+
+    for path in paths:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = [
+                col
+                for col in (case_col, x_col, y_col, label_col)
+                if col not in (reader.fieldnames or [])
+            ]
+            if missing:
+                joined = ", ".join(missing)
+                raise ValueError(f"{path} is missing required column(s): {joined}")
+
+            for line_number, row in enumerate(reader, start=2):
+                case_id = str(row[case_col]).strip()
+                all_case_ids.append(case_id)
+                raw_label = str(row[label_col]).strip()
+                if raw_label == "-1":
+                    continue
+                if raw_label not in {"0", "1"}:
+                    raise ValueError(
+                        f"{path}:{line_number} has label {raw_label!r}; expected 0, 1, or -1"
+                    )
+                observations.append(
+                    Observation(
+                        case_id=case_id,
+                        x=parse_float(row[x_col], path, line_number, x_col),
+                        y=parse_float(row[y_col], path, line_number, y_col),
+                        label=int(raw_label),
+                    )
+                )
+
+    if not observations:
+        raise ValueError("No completed rows with id 0 or 1 were found.")
+    return observations, all_case_ids
+
+
+def parse_float(value: str, path: Path, line_number: int, column: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path}:{line_number} column {column!r} has non-numeric value {value!r}"
+        ) from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{path}:{line_number} column {column!r} is not finite")
+    return parsed
+
+
+def aggregate_observations(observations: Iterable[Observation]) -> list[AggregatePoint]:
+    counts: dict[tuple[float, float], list[int]] = {}
+    for obs in observations:
+        bucket = counts.setdefault((obs.x, obs.y), [0, 0])
+        bucket[0] += 1
+        bucket[1] += obs.label
+    return [
+        AggregatePoint(x=x, y=y, n=n, k=k)
+        for (x, y), (n, k) in sorted(counts.items())
+    ]
+
+
+def infer_domain(
+    observations: Sequence[Observation],
+    *,
+    x_min: float | None,
+    x_max: float | None,
+    y_min: float | None,
+    y_max: float | None,
+) -> Domain:
+    xs = [obs.x for obs in observations]
+    ys = [obs.y for obs in observations]
+    inferred = Domain(
+        x_min=min(xs) if x_min is None else x_min,
+        x_max=max(xs) if x_max is None else x_max,
+        y_min=min(ys) if y_min is None else y_min,
+        y_max=max(ys) if y_max is None else y_max,
+    )
+    return pad_degenerate_domain(inferred)
+
+
+def pad_degenerate_domain(domain: Domain) -> Domain:
+    x_min, x_max, y_min, y_max = domain.x_min, domain.x_max, domain.y_min, domain.y_max
+    if x_min >= x_max:
+        pad = abs(x_min) * 0.05 or 1.0
+        x_min -= pad
+        x_max += pad
+    if y_min >= y_max:
+        pad = abs(y_min) * 0.05 or 1.0
+        y_min -= pad
+        y_max += pad
+    return Domain(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max)
+
+
+def default_length_scale(span: float) -> float:
+    return max(span * 0.20, 1e-12)
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def linspace(lower: float, upper: float, count: int) -> list[float]:
+    if count <= 1:
+        return [(lower + upper) / 2.0]
+    step = (upper - lower) / (count - 1)
+    return [lower + step * i for i in range(count)]
+
+
+def transformed_y(value: float, scale: str) -> float:
+    if scale == "linear":
+        return value
+    if value <= 0:
+        raise ValueError("--y-scale log10 requires all y values and y bounds to be positive")
+    return math.log10(value)
+
+
+def inverse_transformed_y(value: float, scale: str) -> float:
+    if scale == "linear":
+        return value
+    return 10**value
+
+
+def logistic(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def normal_weight(distance: float, length_scale: float) -> float:
+    scaled = distance / max(length_scale, 1e-12)
+    return math.exp(-0.5 * scaled * scaled)
+
+
+def kernel_predict(
+    x: float,
+    y: float,
+    aggregates: Sequence[AggregatePoint],
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> tuple[float, float]:
+    weighted_k = 0.0
+    weighted_n = 0.0
+    for point in aggregates:
+        weight_x = normal_weight(x - point.x, config.length_scale_x)
+        weight_y = normal_weight(y - point.y, config.length_scale_y)
+        weight = weight_x * weight_y
+        rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
+        weighted_k += weight * point.n * rate
+        weighted_n += weight * point.n
+
+    numerator = config.prior_alpha + weighted_k
+    denominator = config.prior_alpha + config.prior_beta + weighted_n
+    probability = numerator / denominator
+    posterior_std = math.sqrt(
+        max(probability * (1.0 - probability), 0.0) / max(denominator + 1.0, 1e-12)
+    )
+    return probability, posterior_std
+
+
+def monotone_probability(
+    y: float,
+    y_c: float,
+    *,
+    direction: str,
+    y_scale: str,
+    transition_width: float,
+    label_noise: float,
+) -> float:
+    y_t = transformed_y(y, y_scale)
+    y_c_t = transformed_y(y_c, y_scale)
+    if direction == "decreasing":
+        margin = (y_c_t - y_t) / transition_width
+    else:
+        margin = (y_t - y_c_t) / transition_width
+    return label_noise + (1.0 - 2.0 * label_noise) * logistic(margin)
+
+
+def monotone_negative_log_likelihood(
+    x: float,
+    y_c: float,
+    aggregates: Sequence[AggregatePoint],
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    loss = 0.0
+    for point in aggregates:
+        weight = normal_weight(x - point.x, config.length_scale_x)
+        if weight < 1e-9:
+            continue
+        rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
+        k = point.n * rate
+        p = clamp(
+            monotone_probability(
+                point.y,
+                y_c,
+                direction=config.monotone_direction,
+                y_scale=config.y_scale,
+                transition_width=config.transition_width,
+                label_noise=config.label_noise,
+            ),
+            1e-9,
+            1.0 - 1e-9,
+        )
+        loss -= weight * (k * math.log(p) + (point.n - k) * math.log(1.0 - p))
+    return loss
+
+
+def estimate_monotone_y_c(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    lower = transformed_y(domain.y_min, config.y_scale)
+    upper = transformed_y(domain.y_max, config.y_scale)
+    candidates_t = linspace(lower, upper, max(config.grid_size, 5))
+    best_t = min(
+        candidates_t,
+        key=lambda value: monotone_negative_log_likelihood(
+            x,
+            inverse_transformed_y(value, config.y_scale),
+            aggregates,
+            config,
+            sampled_rates=sampled_rates,
+        ),
+    )
+    return inverse_transformed_y(best_t, config.y_scale)
+
+
+def estimate_generic_y_c(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    y_values = linspace(domain.y_min, domain.y_max, max(config.grid_size, 5))
+    return min(
+        y_values,
+        key=lambda y: abs(
+            kernel_predict(x, y, aggregates, config, sampled_rates=sampled_rates)[0] - 0.5
+        ),
+    )
+
+
+def estimate_y_c(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    if config.mode == "monotone-y":
+        return estimate_monotone_y_c(
+            x, aggregates, domain, config, sampled_rates=sampled_rates
+        )
+    return estimate_generic_y_c(x, aggregates, domain, config, sampled_rates=sampled_rates)
+
+
+def quantile(values: Sequence[float], probability: float) -> float:
+    if not values:
+        raise ValueError("Cannot calculate a quantile of an empty sample.")
+    ordered = sorted(values)
+    index = probability * (len(ordered) - 1)
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[lower]
+    fraction = index - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def sample_rates(
+    aggregates: Sequence[AggregatePoint], rng: random.Random
+) -> dict[tuple[float, float], float]:
+    return {
+        (point.x, point.y): rng.betavariate(point.k + 1.0, point.n - point.k + 1.0)
+        for point in aggregates
+    }
+
+
+def contour_estimate(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    rng: random.Random,
+) -> ContourEstimate:
+    predicted = estimate_y_c(x, aggregates, domain, config)
+    samples = [
+        estimate_y_c(
+            x,
+            aggregates,
+            domain,
+            config,
+            sampled_rates=sample_rates(aggregates, rng),
+        )
+        for _ in range(max(config.posterior_samples, 0))
+    ]
+    if len(samples) >= 2:
+        std = statistics.pstdev(samples)
+        q05 = quantile(samples, 0.05)
+        q95 = quantile(samples, 0.95)
+    elif len(samples) == 1:
+        std = 0.0
+        q05 = samples[0]
+        q95 = samples[0]
+    else:
+        std = 0.0
+        q05 = predicted
+        q95 = predicted
+    return ContourEstimate(
+        y_c_pred=predicted,
+        y_c_q05=q05,
+        y_c_q95=q95,
+        y_c_std=std,
+    )
+
+
+def predict_probability(
+    x: float,
+    y: float,
+    contour: ContourEstimate,
+    aggregates: Sequence[AggregatePoint],
+    config: ModelConfig,
+) -> tuple[float, float]:
+    if config.mode == "monotone-y":
+        p = monotone_probability(
+            y,
+            contour.y_c_pred,
+            direction=config.monotone_direction,
+            y_scale=config.y_scale,
+            transition_width=config.transition_width,
+            label_noise=config.label_noise,
+        )
+        return p, 0.0
+    return kernel_predict(x, y, aggregates, config)
+
+
+def exact_existing_counts(
+    x: float, y: float, aggregates_by_coord: dict[tuple[float, float], AggregatePoint]
+) -> tuple[int, int]:
+    point = aggregates_by_coord.get((x, y))
+    if point is None:
+        return 0, 0
+    return point.n, point.k
+
+
+def normalized_distance_to_existing(
+    x: float, y: float, aggregates: Sequence[AggregatePoint], domain: Domain
+) -> float:
+    scale_x = domain.x_span or 1.0
+    scale_y = domain.y_span or 1.0
+    return min(
+        math.hypot((x - point.x) / scale_x, (y - point.y) / scale_y)
+        for point in aggregates
+    )
+
+
+def x_gap_score(x: float, aggregates: Sequence[AggregatePoint], domain: Domain) -> float:
+    xs = sorted({point.x for point in aggregates})
+    if not xs:
+        return 1.0
+    augmented = [domain.x_min, *xs, domain.x_max]
+    containing_gap = 0.0
+    for left, right in zip(augmented, augmented[1:]):
+        if left <= x <= right:
+            containing_gap = max(containing_gap, right - left)
+    nearest_x_distance = min(abs(x - existing_x) for existing_x in xs)
+    return clamp(max(containing_gap, nearest_x_distance) / max(domain.x_span, 1e-12), 0.0, 1.0)
+
+
+def choose_batch_counts(
+    n_simulations: int,
+    n_new: int | None,
+    n_repeats: int | None,
+) -> tuple[int, int]:
+    if n_new is not None and n_repeats is not None:
+        if n_new + n_repeats != n_simulations:
+            raise ValueError("--n-new plus --n-repeats must equal --n-simulations")
+        return n_new, n_repeats
+    if n_new is not None:
+        if n_new > n_simulations:
+            raise ValueError("--n-new cannot exceed --n-simulations")
+        return n_new, n_simulations - n_new
+    if n_repeats is not None:
+        if n_repeats > n_simulations:
+            raise ValueError("--n-repeats cannot exceed --n-simulations")
+        return n_simulations - n_repeats, n_repeats
+    repeats = min(3, max(1, round(n_simulations * 3 / 8))) if n_simulations > 1 else 0
+    return n_simulations - repeats, repeats
+
+
+def propose_repeats(
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    rng: random.Random,
+    count: int,
+) -> list[Proposal]:
+    proposals: list[Proposal] = []
+    for point in aggregates:
+        contour = contour_estimate(point.x, aggregates, domain, config, rng)
+        p_pred, p_std = predict_probability(point.x, point.y, contour, aggregates, config)
+        near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
+        disagreement = 1.0 - min(1.0, abs(point.rate - 0.5) * 2.0)
+        low_repeat = 1.0 / max(point.n, 1)
+        contour_uncertainty = clamp(contour.y_c_std / max(domain.y_span, 1e-12), 0.0, 1.0)
+        score = (
+            0.35 * near_contour
+            + 0.30 * disagreement
+            + 0.20 * low_repeat
+            + 0.10 * contour_uncertainty
+            + 0.05 * p_std
+        )
+        reasons = []
+        if 0 < point.k < point.n:
+            reasons.append("existing repeats disagree")
+        if near_contour >= 0.7:
+            reasons.append("near predicted p=0.5 contour")
+        if point.n == 1:
+            reasons.append("only one run at an informative coordinate")
+        if contour_uncertainty >= 0.05:
+            reasons.append("local contour uncertainty remains high")
+        if not reasons:
+            reasons.append("repeat reduces label noise at an informative coordinate")
+        proposals.append(
+            Proposal(
+                x=point.x,
+                y=point.y,
+                proposal_type="repeat",
+                score=score,
+                p_positive_pred=p_pred,
+                contour=contour,
+                n_existing=point.n,
+                k_existing=point.k,
+                reason="; ".join(reasons),
+            )
+        )
+
+    proposals.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
+    return proposals[:count]
+
+
+def candidate_x_values(domain: Domain, aggregates: Sequence[AggregatePoint], count: int) -> list[float]:
+    base = linspace(domain.x_min, domain.x_max, count)
+    xs = sorted({point.x for point in aggregates})
+    midpoints = [(left + right) / 2.0 for left, right in zip(xs, xs[1:])]
+    values = [*base, *midpoints]
+    deduped: list[float] = []
+    for value in sorted(values):
+        if not deduped or abs(value - deduped[-1]) > domain.x_span * 1e-9:
+            deduped.append(value)
+    return deduped
+
+
+def propose_new_points(
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    rng: random.Random,
+    count: int,
+) -> list[Proposal]:
+    if count <= 0:
+        return []
+    aggregates_by_coord = {(point.x, point.y): point for point in aggregates}
+    proposals: list[Proposal] = []
+    x_values = candidate_x_values(domain, aggregates, max(config.grid_size, count * 4))
+
+    for x in x_values:
+        contour = contour_estimate(x, aggregates, domain, config, rng)
+        offsets = [0.0]
+        if contour.y_c_std > 0:
+            offsets.extend([-0.5 * contour.y_c_std, 0.5 * contour.y_c_std])
+        else:
+            offsets.extend([-0.03 * domain.y_span, 0.03 * domain.y_span])
+
+        for offset in offsets:
+            y = clamp(contour.y_c_pred + offset, domain.y_min, domain.y_max)
+            n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
+            if n_existing:
+                continue
+            p_pred, p_std = predict_probability(x, y, contour, aggregates, config)
+            near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
+            novelty = clamp(
+                normalized_distance_to_existing(x, y, aggregates, domain) / 0.20,
+                0.0,
+                1.0,
+            )
+            gap = x_gap_score(x, aggregates, domain)
+            contour_uncertainty = clamp(contour.y_c_std / max(domain.y_span, 1e-12), 0.0, 1.0)
+            score = (
+                0.35 * near_contour
+                + 0.25 * contour_uncertainty
+                + 0.20 * gap
+                + 0.15 * novelty
+                + 0.05 * p_std
+            )
+            reasons = ["new coordinate near predicted contour"]
+            if gap >= 0.25:
+                reasons.append("large gap in sampled x values")
+            if contour_uncertainty >= 0.05:
+                reasons.append("high local contour uncertainty")
+            if novelty >= 0.75:
+                reasons.append("away from existing coordinates")
+            proposals.append(
+                Proposal(
+                    x=x,
+                    y=y,
+                    proposal_type="new",
+                    score=score,
+                    p_positive_pred=p_pred,
+                    contour=contour,
+                    n_existing=0,
+                    k_existing=0,
+                    reason="; ".join(reasons),
+                )
+            )
+
+    proposals.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
+    selected: list[Proposal] = []
+    for proposal in proposals:
+        if len(selected) >= count:
+            break
+        if all(
+            math.hypot(
+                (proposal.x - chosen.x) / max(domain.x_span, 1e-12),
+                (proposal.y - chosen.y) / max(domain.y_span, 1e-12),
+            )
+            >= 0.03
+            for chosen in selected
+        ):
+            selected.append(proposal)
+    return selected
+
+
+def propose_next_batch(
+    observations: Sequence[Observation],
+    *,
+    domain: Domain,
+    config: ModelConfig,
+    n_simulations: int,
+    n_new: int | None,
+    n_repeats: int | None,
+    seed: int,
+) -> list[Proposal]:
+    if n_simulations <= 0:
+        raise ValueError("--n-simulations must be positive")
+    aggregates = aggregate_observations(observations)
+    new_count, repeat_count = choose_batch_counts(n_simulations, n_new, n_repeats)
+    rng = random.Random(seed)
+
+    repeats = propose_repeats(aggregates, domain, config, rng, repeat_count)
+    new_points = propose_new_points(aggregates, domain, config, rng, new_count)
+
+    if len(repeats) < repeat_count:
+        new_points.extend(
+            propose_new_points(
+                aggregates,
+                domain,
+                config,
+                rng,
+                new_count + repeat_count - len(repeats),
+            )[len(new_points) :]
+        )
+    if len(new_points) < new_count:
+        repeats.extend(
+            propose_repeats(
+                aggregates,
+                domain,
+                config,
+                rng,
+                repeat_count + new_count - len(new_points),
+            )[len(repeats) :]
+        )
+
+    batch = [*new_points[:new_count], *repeats[:repeat_count]]
+    batch.sort(key=lambda proposal: (proposal.proposal_type != "new", -proposal.score))
+    return batch[:n_simulations]
+
+
+def next_case_id_generator(existing_case_ids: Sequence[str]) -> Iterable[str]:
+    numeric_ids: list[int] = []
+    for case_id in existing_case_ids:
+        try:
+            numeric_ids.append(int(case_id))
+        except ValueError:
+            continue
+    if len(numeric_ids) == len(existing_case_ids):
+        next_id = max(numeric_ids, default=0) + 1
+        while True:
+            yield str(next_id)
+            next_id += 1
+    index = 1
+    existing = set(existing_case_ids)
+    while True:
+        candidate = f"proposal_{index:04d}"
+        if candidate not in existing:
+            yield candidate
+        index += 1
+
+
+def format_float(value: float) -> str:
+    if not math.isfinite(value):
+        return ""
+    return f"{value:.10g}"
+
+
+def proposals_to_rows(
+    proposals: Sequence[Proposal],
+    *,
+    existing_case_ids: Sequence[str],
+    legacy_columns_only: bool,
+) -> list[dict[str, str]]:
+    case_ids = next_case_id_generator(existing_case_ids)
+    rows: list[dict[str, str]] = []
+    for proposal in proposals:
+        row = {
+            "caseId": next(case_ids),
+            "x": format_float(proposal.x),
+            "y": format_float(proposal.y),
+            "id": "-1",
+            "proposal_type": proposal.proposal_type,
+            "score": format_float(proposal.score),
+            "p_positive_pred": format_float(proposal.p_positive_pred),
+            "y_c_pred": format_float(proposal.contour.y_c_pred),
+            "y_c_q05": format_float(proposal.contour.y_c_q05),
+            "y_c_q95": format_float(proposal.contour.y_c_q95),
+            "y_c_std": format_float(proposal.contour.y_c_std),
+            "n_existing": str(proposal.n_existing),
+            "k_existing": str(proposal.k_existing),
+            "reason": proposal.reason,
+        }
+        rows.append({col: row[col] for col in (LEGACY_COLUMNS if legacy_columns_only else PROPOSAL_COLUMNS)})
+    return rows
+
+
+def write_rows(rows: Sequence[dict[str, str]], outfile: Path | None, *, legacy: bool) -> None:
+    columns = LEGACY_COLUMNS if legacy else PROPOSAL_COLUMNS
+    if outfile is None:
+        writer = csv.DictWriter(sys.stdout, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        return
+    with outfile.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Propose the next batch for noisy 2-D binary contour learning."
+    )
+    parser.add_argument("csv_files", nargs="+", type=Path)
+    parser.add_argument("--outfile", type=Path)
+    parser.add_argument("--n-simulations", type=int, default=8)
+    parser.add_argument("--n-new", type=int)
+    parser.add_argument("--n-repeats", type=int)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--case-col", default="caseId")
+    parser.add_argument("--x-col", default="x")
+    parser.add_argument("--y-col", default="y")
+    parser.add_argument("--label-col", default="id")
+    parser.add_argument("--x-min", type=float)
+    parser.add_argument("--x-max", type=float)
+    parser.add_argument("--y-min", type=float)
+    parser.add_argument("--y-max", type=float)
+    parser.add_argument("--mode", choices=["generic", "monotone-y"], default="generic")
+    parser.add_argument(
+        "--monotone-direction",
+        choices=["decreasing", "increasing"],
+        default="decreasing",
+        help="Direction for p(id=1) as y increases when --mode monotone-y is used.",
+    )
+    parser.add_argument("--y-scale", choices=["linear", "log10"], default="linear")
+    parser.add_argument("--transition-width", type=float, default=0.10)
+    parser.add_argument("--label-noise", type=float, default=0.02)
+    parser.add_argument("--length-scale-x", type=float)
+    parser.add_argument("--length-scale-y", type=float)
+    parser.add_argument("--prior-alpha", type=float, default=1.0)
+    parser.add_argument("--prior-beta", type=float, default=1.0)
+    parser.add_argument("--grid-size", type=int, default=41)
+    parser.add_argument("--posterior-samples", type=int, default=80)
+    parser.add_argument("--legacy-columns-only", action="store_true")
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.transition_width <= 0:
+        raise ValueError("--transition-width must be positive")
+    if not 0 <= args.label_noise < 0.5:
+        raise ValueError("--label-noise must be in [0, 0.5)")
+    if args.prior_alpha <= 0 or args.prior_beta <= 0:
+        raise ValueError("--prior-alpha and --prior-beta must be positive")
+    if args.grid_size < 5:
+        raise ValueError("--grid-size must be at least 5")
+    if args.posterior_samples < 0:
+        raise ValueError("--posterior-samples cannot be negative")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        validate_args(args)
+        observations, all_case_ids = read_csv_files(
+            args.csv_files,
+            case_col=args.case_col,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            label_col=args.label_col,
+        )
+        domain = infer_domain(
+            observations,
+            x_min=args.x_min,
+            x_max=args.x_max,
+            y_min=args.y_min,
+            y_max=args.y_max,
+        )
+        config = ModelConfig(
+            mode=args.mode,
+            monotone_direction=args.monotone_direction,
+            y_scale=args.y_scale,
+            transition_width=args.transition_width,
+            label_noise=args.label_noise,
+            length_scale_x=args.length_scale_x or default_length_scale(domain.x_span),
+            length_scale_y=args.length_scale_y or default_length_scale(domain.y_span),
+            prior_alpha=args.prior_alpha,
+            prior_beta=args.prior_beta,
+            grid_size=args.grid_size,
+            posterior_samples=args.posterior_samples,
+        )
+        proposals = propose_next_batch(
+            observations,
+            domain=domain,
+            config=config,
+            n_simulations=args.n_simulations,
+            n_new=args.n_new,
+            n_repeats=args.n_repeats,
+            seed=args.seed,
+        )
+        rows = proposals_to_rows(
+            proposals,
+            existing_case_ids=all_case_ids,
+            legacy_columns_only=args.legacy_columns_only,
+        )
+        write_rows(rows, args.outfile, legacy=args.legacy_columns_only)
+    except (OSError, ValueError) as exc:
+        parser.exit(status=2, message=f"error: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
