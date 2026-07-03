@@ -38,4 +38,10 @@ The output rows are proposed experiments with `id = -1`. Replace each `-1`
 with the observed `0` or `1`, append the rows to the campaign data, and rerun
 the script for the next sweep.
 
+## Tests
+
+```bash
+python3 -m unittest
+```
+
 More detail lives in [docs/](docs/).
