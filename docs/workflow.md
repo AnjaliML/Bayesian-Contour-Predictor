@@ -27,6 +27,31 @@ python3 propose_next_sweep.py Sweep-0.csv \
 8. Repeat until the contour is resolved enough for the scientific or
    engineering goal.
 
+## End-To-End Visualizer
+
+For the drop-injection example, run:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py
+```
+
+The visualizer starts from an initial space-filling design, calls
+`propose_next_sweep.py` to request each next batch, calls `classify_drops.py` to
+simulate the experiment labels, and updates a browser animation as the campaign
+advances.
+
+Useful options:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py \
+  --iterations 8 \
+  --batch-size 8 \
+  --seed 22
+```
+
+The generated CSV files, `state.json`, and `index.html` are written under
+`visualization_runs/` by default.
+
 ## Multiple CSV Inputs
 
 The script accepts one or more files:

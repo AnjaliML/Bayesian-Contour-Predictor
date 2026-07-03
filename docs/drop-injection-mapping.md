@@ -48,3 +48,22 @@ Oh_c(Rr) = 0.0326 - 0.0398 exp(-0.348 Rr)
 
 The new proposal engine is different: it learns a contour from campaign data
 and proposes the next informative experiments.
+
+## Visual End-To-End Demo
+
+Run:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py
+```
+
+This script keeps the drop-injection physical labels visible in the animation:
+
+- `Rr` is shown on the horizontal axis.
+- `Oh` is shown on a log-scaled vertical axis.
+- green points are `id = 1`, drops.
+- red points are `id = 0`, no drops.
+- outlined points are the next proposed experiments.
+
+Under the hood, acquisition still flows through the generic `x,y,id` proposal
+engine, and each simulated experiment label is produced by `classify_drops.py`.

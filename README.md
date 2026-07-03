@@ -38,6 +38,16 @@ The output rows are proposed experiments with `id = -1`. Replace each `-1`
 with the observed `0` or `1`, append the rows to the campaign data, and rerun
 the script for the next sweep.
 
+Run the drop-injection workflow with a live browser visualization:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py
+```
+
+This creates a local `visualization_runs/` directory, opens an animated canvas
+view, calls `propose_next_sweep.py` for each batch, and calls
+`classify_drops.py` as the experiment runner.
+
 ## Tests
 
 ```bash
