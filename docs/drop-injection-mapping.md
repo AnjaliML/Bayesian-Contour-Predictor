@@ -57,6 +57,9 @@ Run:
 python3 end-to-end-with-visualization-drop-injection.py
 ```
 
+By default this runs 60 active-learning sweeps. Use `--iterations N` or
+`--n-iterations N` for longer campaigns.
+
 This script keeps the drop-injection physical labels visible in the animation:
 
 - `Rr` is shown on the horizontal axis.

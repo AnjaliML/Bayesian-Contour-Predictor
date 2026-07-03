@@ -75,7 +75,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "propose_next_sweep.py and classify_drops.py under the hood."
         )
     )
-    parser.add_argument("--iterations", type=int, default=6)
+    parser.add_argument(
+        "--iterations",
+        "--n-iterations",
+        type=int,
+        default=60,
+        help="Number of active-learning sweeps to run.",
+    )
     parser.add_argument("--initial-points", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=11)
@@ -84,9 +90,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--oh-min", type=float, default=0.01)
     parser.add_argument("--oh-max", type=float, default=0.20)
     parser.add_argument("--grid-size", type=int, default=41)
-    parser.add_argument("--posterior-samples", type=int, default=40)
-    parser.add_argument("--preview-points", type=int, default=48)
-    parser.add_argument("--delay", type=float, default=0.35)
+    parser.add_argument("--posterior-samples", type=int, default=24)
+    parser.add_argument("--preview-points", type=int, default=80)
+    parser.add_argument("--delay", type=float, default=0.08)
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--no-browser", action="store_true")
@@ -349,16 +355,21 @@ def update_visual_state(
     *,
     status: str,
     iteration: int,
+    total_iterations: int,
+    batch_size: int,
     domain: Domain,
     completed: Sequence[CompletedRun],
     proposals: Sequence[ProposedRun],
     contour: Sequence[dict[str, float]],
     true_contour: Sequence[dict[str, float]],
+    history: Sequence[dict[str, Any]],
     messages: Sequence[str],
 ) -> None:
     state = {
         "status": status,
         "iteration": iteration,
+        "total_iterations": total_iterations,
+        "batch_size": batch_size,
         "domain": {
             "rr_min": domain.rr_min,
             "rr_max": domain.rr_max,
@@ -369,7 +380,8 @@ def update_visual_state(
         "proposals": proposals_payload(proposals),
         "contour": list(contour),
         "true_contour": list(true_contour),
-        "messages": list(messages[-12:]),
+        "history": list(history),
+        "messages": list(messages[-8:]),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     write_state(output_dir, state)
@@ -387,63 +399,125 @@ def write_html(output_dir: Path) -> None:
     :root {
       color-scheme: light;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      --ink: #1c2430;
-      --muted: #607085;
-      --line: #d7dee8;
-      --drop: #0b7f62;
-      --no-drop: #b83a4b;
-      --proposal: #d99b15;
-      --curve: #265ecf;
-      --truth: #202936;
-      --band: rgba(38, 94, 207, 0.14);
+      --bg: #eef2ef;
+      --paper: #fbfcfb;
+      --panel: #ffffff;
+      --ink: #202933;
+      --muted: #657385;
+      --soft: #edf1f4;
+      --line: #d8e0df;
+      --drop: #0f8065;
+      --no-drop: #c4495a;
+      --proposal: #d99a22;
+      --curve: #2e63d3;
+      --truth: #26313d;
+      --band: rgba(46, 99, 211, 0.16);
     }
     body {
       margin: 0;
-      background: #f6f7f9;
+      background: var(--bg);
       color: var(--ink);
     }
-    main {
+    .app {
       display: grid;
-      grid-template-columns: minmax(520px, 1fr) 340px;
-      gap: 18px;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 14px;
       min-height: 100vh;
-      padding: 18px;
+      max-width: 1880px;
+      margin: 0 auto;
+      padding: 16px;
       box-sizing: border-box;
     }
-    .plot-shell, aside {
-      background: #ffffff;
+    .topbar {
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(28, 36, 48, 0.06);
+      box-shadow: 0 10px 26px rgba(32, 41, 51, 0.07);
+      padding: 14px 16px;
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(260px, 520px);
+      gap: 18px;
+      align-items: center;
     }
-    .plot-shell {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-    header {
-      padding: 14px 16px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    h1 {
-      font-size: 18px;
-      line-height: 1.2;
-      margin: 0 0 4px;
-      font-weight: 700;
+    .title-block h1 {
+      font-size: 22px;
+      line-height: 1.15;
+      margin: 0 0 5px;
+      font-weight: 760;
       letter-spacing: 0;
     }
     #subtitle {
       color: var(--muted);
       font-size: 13px;
     }
+    .progress-wrap {
+      display: grid;
+      gap: 8px;
+    }
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .progress-track {
+      height: 10px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    #progressFill {
+      width: 0%;
+      height: 100%;
+      background: var(--curve);
+      transition: width 220ms ease;
+    }
+    .content {
+      display: grid;
+      grid-template-columns: minmax(680px, 1fr) 370px;
+      gap: 14px;
+      min-height: 0;
+      align-items: start;
+    }
+    .plot-shell, aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 26px rgba(32, 41, 51, 0.07);
+      min-width: 0;
+    }
+    .plot-shell {
+      display: grid;
+      grid-template-rows: auto minmax(420px, 1fr);
+      overflow: hidden;
+    }
+    .plot-caption {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .caption-strong {
+      color: var(--ink);
+      font-weight: 700;
+      font-size: 13px;
+    }
     canvas {
       width: 100%;
-      height: min(72vh, 720px);
+      height: clamp(480px, 68vh, 740px);
       display: block;
+      background: var(--paper);
     }
     aside {
       padding: 14px;
       overflow: auto;
+      max-height: calc(100vh - 112px);
     }
     .stats {
       display: grid;
@@ -454,11 +528,12 @@ def write_html(output_dir: Path) -> None:
     .stat {
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 9px;
+      padding: 10px;
+      background: #fcfdfc;
     }
     .stat b {
       display: block;
-      font-size: 18px;
+      font-size: 19px;
       line-height: 1.1;
     }
     .stat span {
@@ -476,6 +551,51 @@ def write_html(output_dir: Path) -> None:
       display: grid;
       gap: 8px;
       font-size: 13px;
+    }
+    .timeline {
+      height: 92px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      overflow: hidden;
+      background: #fcfdfc;
+    }
+    .timeline-bar {
+      min-width: 3px;
+      max-width: 9px;
+      flex: 1 1 5px;
+      height: 100%;
+      display: flex;
+      flex-direction: column-reverse;
+      border-radius: 3px 3px 0 0;
+      overflow: hidden;
+      opacity: 0.92;
+    }
+    .timeline-drop {
+      background: var(--drop);
+    }
+    .timeline-no-drop {
+      background: var(--no-drop);
+    }
+    .proposal-list {
+      display: grid;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .proposal-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fcfdfc;
+    }
+    .proposal-card b {
+      color: var(--ink);
+    }
+    .proposal-card span {
+      color: var(--muted);
     }
     .legend-row {
       display: flex;
@@ -505,18 +625,21 @@ def write_html(output_dir: Path) -> None:
       padding: 0;
       margin: 0;
       display: grid;
-      gap: 8px;
+      gap: 7px;
       font-size: 12px;
       color: var(--ink);
     }
     #messages li {
-      border-left: 3px solid var(--line);
+      border-left: 3px solid var(--curve);
       padding-left: 8px;
       color: #344154;
     }
-    @media (max-width: 900px) {
-      main {
+    @media (max-width: 1060px) {
+      .topbar, .content {
         grid-template-columns: 1fr;
+      }
+      aside {
+        max-height: none;
       }
       canvas {
         height: 62vh;
@@ -525,40 +648,60 @@ def write_html(output_dir: Path) -> None:
   </style>
 </head>
 <body>
-<main>
-  <section class="plot-shell">
-    <header>
+<main class="app">
+  <header class="topbar">
+    <div class="title-block">
       <h1>Drop Injection Active Learning</h1>
       <div id="subtitle">Waiting for campaign state...</div>
-    </header>
-    <canvas id="plot" width="1100" height="720"></canvas>
-  </section>
-  <aside>
-    <div class="stats">
-      <div class="stat"><b id="iteration">0</b><span>Iteration</span></div>
-      <div class="stat"><b id="completed">0</b><span>Completed runs</span></div>
-      <div class="stat"><b id="drops">0</b><span>Drops</span></div>
-      <div class="stat"><b id="pending">0</b><span>Current proposals</span></div>
     </div>
-    <h2>Legend</h2>
-    <div class="legend">
-      <div class="legend-row"><span class="swatch" style="background: var(--drop)"></span>Drops, id = 1</div>
-      <div class="legend-row"><span class="swatch" style="background: var(--no-drop)"></span>No drops, id = 0</div>
-      <div class="legend-row"><span class="swatch" style="border-color: var(--proposal)"></span>Proposed next run</div>
-      <div class="legend-row"><span class="line-swatch"></span>Learned contour</div>
-      <div class="legend-row"><span class="line-swatch truth-swatch"></span>Classifier contour</div>
+    <div class="progress-wrap">
+      <div class="progress-meta">
+        <span id="progressLabel">0 of 0 sweeps</span>
+        <span id="batchLabel">batch size 0</span>
+      </div>
+      <div class="progress-track"><div id="progressFill"></div></div>
     </div>
-    <h2>Process</h2>
-    <ul id="messages"></ul>
-  </aside>
+  </header>
+  <div class="content">
+    <section class="plot-shell">
+      <div class="plot-caption">
+        <span class="caption-strong">Rr / Oh regime map</span>
+        <span>older points fade; latest sweep is emphasized</span>
+      </div>
+      <canvas id="plot" width="1100" height="720"></canvas>
+    </section>
+    <aside>
+      <div class="stats">
+        <div class="stat"><b id="iteration">0/0</b><span>Iteration</span></div>
+        <div class="stat"><b id="completed">0</b><span>Completed runs</span></div>
+        <div class="stat"><b id="drops">0</b><span>Drops</span></div>
+        <div class="stat"><b id="pending">0</b><span>Current proposals</span></div>
+      </div>
+      <h2>Sweep Timeline</h2>
+      <div id="timeline" class="timeline"></div>
+      <h2>Current Proposals</h2>
+      <div id="proposalList" class="proposal-list"></div>
+      <h2>Legend</h2>
+      <div class="legend">
+        <div class="legend-row"><span class="swatch" style="background: var(--drop)"></span>Drops, id = 1</div>
+        <div class="legend-row"><span class="swatch" style="background: var(--no-drop)"></span>No-drops, id = 0</div>
+        <div class="legend-row"><span class="swatch" style="border-color: var(--proposal)"></span>Proposed next run</div>
+        <div class="legend-row"><span class="line-swatch"></span>Learned contour</div>
+        <div class="legend-row"><span class="line-swatch truth-swatch"></span>Classifier contour</div>
+      </div>
+      <h2>Process</h2>
+      <ul id="messages"></ul>
+    </aside>
+  </div>
 </main>
 <script>
 const canvas = document.getElementById("plot");
 const ctx = canvas.getContext("2d");
 let latest = null;
-const pad = { left: 78, right: 28, top: 34, bottom: 64 };
+const pad = { left: 78, right: 36, top: 36, bottom: 66 };
 
 function log10(v) { return Math.log(v) / Math.LN10; }
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
@@ -597,14 +740,15 @@ function scales(state) {
 
 function drawGrid(state, s) {
   const { area } = s;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = "#d7dee8";
+  const rect = canvas.getBoundingClientRect();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  ctx.fillStyle = "#fbfcfb";
+  ctx.fillRect(0, 0, rect.width, rect.height);
+  ctx.strokeStyle = "#d8e0df";
   ctx.lineWidth = 1;
   ctx.strokeRect(area.x0, area.y0, area.x1 - area.x0, area.y1 - area.y0);
 
-  ctx.fillStyle = "#607085";
+  ctx.fillStyle = "#657385";
   ctx.font = "12px system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
@@ -615,27 +759,28 @@ function drawGrid(state, s) {
     ctx.beginPath();
     ctx.moveTo(x, area.y0);
     ctx.lineTo(x, area.y1);
-    ctx.strokeStyle = i === 0 || i === 5 ? "#d7dee8" : "#eef2f6";
+    ctx.strokeStyle = i === 0 || i === 5 ? "#d8e0df" : "#edf1f4";
     ctx.stroke();
     ctx.fillText(rr.toFixed(1), x, area.y1 + 12);
   }
 
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  const yTicks = [0.01, 0.02, 0.04, 0.08, 0.16].filter(v => v >= d.oh_min && v <= d.oh_max);
+  const yTicks = [0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.12, 0.16, 0.2]
+    .filter(v => v >= d.oh_min && v <= d.oh_max);
   for (const oh of yTicks) {
     const y = s.y(oh);
     ctx.beginPath();
     ctx.moveTo(area.x0, y);
     ctx.lineTo(area.x1, y);
-    ctx.strokeStyle = "#eef2f6";
+    ctx.strokeStyle = "#edf1f4";
     ctx.stroke();
     ctx.fillText(oh.toFixed(3).replace(/0+$/, "").replace(/\\.$/, ""), area.x0 - 10, y);
   }
 
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
-  ctx.fillStyle = "#1c2430";
+  ctx.fillStyle = "#202933";
   ctx.font = "13px system-ui, sans-serif";
   ctx.fillText("Rr", (area.x0 + area.x1) / 2, area.y1 + 48);
   ctx.save();
@@ -651,6 +796,8 @@ function drawLine(points, s, xKey, yKey, color, width, dashed = false) {
   ctx.save();
   ctx.strokeStyle = color;
   ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
   ctx.setLineDash(dashed ? [7, 6] : []);
   ctx.beginPath();
   valid.forEach((p, i) => {
@@ -667,7 +814,7 @@ function drawBand(points, s) {
   const valid = points.filter(p => p.y_c_q05 > 0 && p.y_c_q95 > 0);
   if (valid.length < 2) return;
   ctx.save();
-  ctx.fillStyle = "rgba(38, 94, 207, 0.14)";
+  ctx.fillStyle = "rgba(46, 99, 211, 0.16)";
   ctx.beginPath();
   valid.forEach((p, i) => {
     const x = s.x(p.Rr);
@@ -683,16 +830,31 @@ function drawBand(points, s) {
   ctx.restore();
 }
 
+function jitterFor(caseId) {
+  const text = String(caseId || "");
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  const angle = (hash % 360) * Math.PI / 180;
+  const radius = ((hash % 9) / 9) * 2.4;
+  return { dx: Math.cos(angle) * radius, dy: Math.sin(angle) * radius };
+}
+
 function drawPoints(state, s) {
+  const latestSweep = Math.max(0, ...state.completed.map(p => p.sweep || 0));
   for (const p of state.completed) {
-    const x = s.x(p.Rr);
-    const y = s.y(p.Oh);
+    const jitter = jitterFor(p.caseId);
+    const x = s.x(p.Rr) + jitter.dx;
+    const y = s.y(p.Oh) + jitter.dy;
+    const recent = (p.sweep || 0) === latestSweep;
+    const radius = recent ? 6.2 : 3.8;
     ctx.beginPath();
-    ctx.arc(x, y, 5.5, 0, Math.PI * 2);
-    ctx.fillStyle = p.id === 1 ? "#0b7f62" : "#b83a4b";
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.globalAlpha = recent ? 0.96 : 0.48;
+    ctx.fillStyle = p.id === 1 ? "#0f8065" : "#c4495a";
     ctx.fill();
+    ctx.globalAlpha = 1;
     ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = recent ? 2.2 : 1.2;
     ctx.stroke();
   }
   for (const p of state.proposals) {
@@ -701,11 +863,34 @@ function drawPoints(state, s) {
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(Math.PI / 4);
-    ctx.strokeStyle = "#d99b15";
-    ctx.lineWidth = 2.4;
-    ctx.strokeRect(-5.5, -5.5, 11, 11);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
+    ctx.strokeStyle = "#d99a22";
+    ctx.lineWidth = 2.8;
+    ctx.fillRect(-6.5, -6.5, 13, 13);
+    ctx.strokeRect(-6.5, -6.5, 13, 13);
     ctx.restore();
   }
+}
+
+function drawPlotSummary(state, s) {
+  const { area } = s;
+  const drops = state.completed.filter(p => p.id === 1).length;
+  ctx.save();
+  ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+  ctx.strokeStyle = "#d8e0df";
+  ctx.lineWidth = 1;
+  const text = `${state.completed.length} completed | ${drops} drops | ${state.proposals.length} pending`;
+  ctx.font = "12px system-ui, sans-serif";
+  const width = ctx.measureText(text).width + 24;
+  ctx.beginPath();
+  ctx.roundRect(area.x1 - width - 12, area.y0 + 12, width, 30, 6);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#202933";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, area.x1 - width / 2 - 12, area.y0 + 27);
+  ctx.restore();
 }
 
 function draw() {
@@ -714,18 +899,68 @@ function draw() {
   const s = scales(state);
   drawGrid(state, s);
   drawBand(state.contour || [], s);
-  drawLine(state.true_contour || [], s, "Rr", "Oh", "#202936", 2, true);
-  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#265ecf", 3, false);
+  drawLine(state.true_contour || [], s, "Rr", "Oh", "#26313d", 2, true);
+  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#2e63d3", 3.2, false);
   drawPoints(state, s);
+  drawPlotSummary(state, s);
 }
 
 function updateSidebar(state) {
   const drops = state.completed.filter(p => p.id === 1).length;
-  document.getElementById("subtitle").textContent = `${state.status} · updated ${state.updated_at}`;
-  document.getElementById("iteration").textContent = state.iteration;
+  const total = state.total_iterations || state.iteration || 0;
+  const pct = total ? Math.min(100, Math.round(state.iteration / total * 100)) : 0;
+  document.getElementById("subtitle").textContent = `${state.status} | updated ${state.updated_at}`;
+  document.getElementById("iteration").textContent = `${state.iteration}/${total}`;
   document.getElementById("completed").textContent = state.completed.length;
   document.getElementById("drops").textContent = drops;
   document.getElementById("pending").textContent = state.proposals.length;
+  document.getElementById("progressLabel").textContent = `${state.iteration} of ${total} sweeps`;
+  document.getElementById("batchLabel").textContent = `batch size ${state.batch_size || 0}`;
+  document.getElementById("progressFill").style.width = `${pct}%`;
+
+  const timeline = document.getElementById("timeline");
+  timeline.innerHTML = "";
+  const history = (state.history || []).slice(-140);
+  if (!history.length) {
+    const empty = document.createElement("div");
+    empty.style.color = "#657385";
+    empty.style.fontSize = "12px";
+    empty.textContent = "timeline will fill as sweeps complete";
+    timeline.appendChild(empty);
+  }
+  for (const item of history) {
+    const totalRuns = Math.max(1, item.completed || 1);
+    const bar = document.createElement("div");
+    bar.className = "timeline-bar";
+    bar.title = `sweep ${item.iteration}: ${item.drops} drops, ${item.no_drops} no-drops`;
+    const drop = document.createElement("span");
+    drop.className = "timeline-drop";
+    drop.style.height = item.drops ? `${Math.max(4, item.drops / totalRuns * 100)}%` : "0";
+    const noDrop = document.createElement("span");
+    noDrop.className = "timeline-no-drop";
+    noDrop.style.height = item.no_drops ? `${Math.max(4, item.no_drops / totalRuns * 100)}%` : "0";
+    bar.appendChild(drop);
+    bar.appendChild(noDrop);
+    timeline.appendChild(bar);
+  }
+
+  const proposalList = document.getElementById("proposalList");
+  proposalList.innerHTML = "";
+  const proposals = state.proposals || [];
+  if (!proposals.length) {
+    const empty = document.createElement("div");
+    empty.className = "proposal-card";
+    empty.innerHTML = "<span>No current proposals.</span>";
+    proposalList.appendChild(empty);
+  }
+  for (const proposal of proposals.slice(0, 5)) {
+    const row = document.createElement("div");
+    row.className = "proposal-card";
+    row.innerHTML = `<b>${proposal.proposal_type}</b> <span>case ${proposal.caseId}</span><br>` +
+      `<span>Rr ${proposal.Rr.toFixed(3)}, Oh ${proposal.Oh.toPrecision(3)}, score ${proposal.score.toFixed(3)}</span>`;
+    proposalList.appendChild(row);
+  }
+
   const messages = document.getElementById("messages");
   messages.innerHTML = "";
   for (const message of state.messages || []) {
@@ -789,17 +1024,21 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     write_html(output_dir)
 
     messages: list[str] = []
+    history: list[dict[str, Any]] = []
     true_contour = find_true_contour(domain)
     messages.append("Built the reference classifier contour using classify_drops.py.")
     update_visual_state(
         output_dir,
         status="starting",
         iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
         domain=domain,
         completed=[],
         proposals=[],
         contour=[],
         true_contour=true_contour,
+        history=history,
         messages=messages,
     )
 
@@ -821,11 +1060,14 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         output_dir,
         status="initial design complete",
         iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
         domain=domain,
         completed=all_completed,
         proposals=[],
         contour=[],
         true_contour=true_contour,
+        history=history,
         messages=messages,
     )
     sleep_if_requested(args.delay)
@@ -857,18 +1099,23 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         )
         preview_contour = build_preview_contour(preview_rows)
 
+        new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
+        repeat_proposals = len(proposals) - new_proposals
         messages.append(
-            f"Sweep {iteration}: proposed {len(proposals)} runs with propose_next_sweep.py."
+            f"Sweep {iteration}: proposed {new_proposals} new and {repeat_proposals} repeat runs."
         )
         update_visual_state(
             output_dir,
             status=f"sweep {iteration} proposed",
             iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
             domain=domain,
             completed=all_completed,
             proposals=proposals,
             contour=preview_contour,
             true_contour=true_contour,
+            history=history,
             messages=messages,
         )
         sleep_if_requested(args.delay)
@@ -882,6 +1129,8 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 output_dir,
                 status=f"sweep {iteration} running experiments",
                 iteration=iteration,
+                total_iterations=args.iterations,
+                batch_size=args.batch_size,
                 domain=domain,
                 completed=all_completed,
                 proposals=[
@@ -891,8 +1140,9 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 ],
                 contour=preview_contour,
                 true_contour=true_contour,
+                history=history,
                 messages=[
-                    *messages,
+                    *messages[-6:],
                     f"Ran case {run.case_id}: Rr={run.rr:.3g}, Oh={run.oh:.3g}, id={run.label}.",
                 ],
             )
@@ -901,18 +1151,39 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         completed_path = output_dir / f"Sweep-{iteration}_completed.csv"
         completed_files.append(completed_path)
         write_completed_sweep(completed_path, newly_completed)
+        sweep_drops = sum(run.label for run in newly_completed)
+        sweep_no_drops = len(newly_completed) - sweep_drops
+        mean_score = (
+            sum(proposal.score for proposal in proposals) / len(proposals)
+            if proposals
+            else 0.0
+        )
+        history.append(
+            {
+                "iteration": iteration,
+                "completed": len(newly_completed),
+                "drops": sweep_drops,
+                "no_drops": sweep_no_drops,
+                "new": new_proposals,
+                "repeat": repeat_proposals,
+                "mean_score": mean_score,
+            }
+        )
         messages.append(
-            f"Sweep {iteration}: completed labels with classify_drops.py and appended results."
+            f"Sweep {iteration}: observed {sweep_drops} drops and {sweep_no_drops} no-drops."
         )
         update_visual_state(
             output_dir,
             status=f"sweep {iteration} complete",
             iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
             domain=domain,
             completed=all_completed,
             proposals=[],
             contour=preview_contour,
             true_contour=true_contour,
+            history=history,
             messages=messages,
         )
         sleep_if_requested(args.delay)
@@ -922,11 +1193,14 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         output_dir,
         status="complete",
         iteration=args.iterations,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
         domain=domain,
         completed=all_completed,
         proposals=[],
         contour=preview_contour if args.iterations else [],
         true_contour=true_contour,
+        history=history,
         messages=messages,
     )
 

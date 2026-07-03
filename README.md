@@ -48,6 +48,12 @@ This creates a local `visualization_runs/` directory, opens an animated canvas
 view, calls `propose_next_sweep.py` for each batch, and calls
 `classify_drops.py` as the experiment runner.
 
+The visualizer defaults to 60 active-learning sweeps. Set the run length with:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py --iterations 120
+```
+
 ## Tests
 
 ```bash

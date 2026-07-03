@@ -44,10 +44,15 @@ Useful options:
 
 ```bash
 python3 end-to-end-with-visualization-drop-injection.py \
-  --iterations 8 \
+  --iterations 120 \
   --batch-size 8 \
+  --delay 0.04 \
   --seed 22
 ```
+
+`--n-iterations` is accepted as an alias for `--iterations`. Increase
+`--delay` for a slower presentation run, or set `--delay 0` for a fast
+batch-style run that still writes the final visualization artifacts.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.
