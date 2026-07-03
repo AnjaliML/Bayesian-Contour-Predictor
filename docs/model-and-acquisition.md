@@ -91,3 +91,9 @@ The `score` ranks proposals using:
 - contradictory or low-repeat data for repeats.
 
 Every row includes a `reason` column so the next experiment is explainable.
+
+For monotone contours, new-point acquisition now uses both `y` from sampled `x`
+locations and inverse `x` from sampled `y` levels. The inverse locator helps
+probe boundary regions where the current `Y(x)` contour sits too high or too low
+and the next useful experiment is a vertical bracket rather than another point
+on the current line.

@@ -617,6 +617,15 @@ def normalized_distance_to_existing(
     )
 
 
+def boundary_focus(x: float, domain: Domain, config: ModelConfig) -> float:
+    lower = transformed_value(domain.x_min, config.x_scale, "x")
+    upper = transformed_value(domain.x_max, config.x_scale, "x")
+    span = max(upper - lower, 1e-12)
+    x_t = transformed_x(x, config)
+    edge_distance = min(abs(x_t - lower), abs(upper - x_t))
+    return clamp(1.0 - edge_distance / (0.16 * span), 0.0, 1.0)
+
+
 def x_gap_score(
     x: float, aggregates: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
 ) -> float:
@@ -784,9 +793,13 @@ def contour_uncertainty_fraction(
     return clamp(spread / max(span, 1e-12), 0.0, 1.0)
 
 
-def y_offsets_near_contour(
-    contour: ContourEstimate, domain: Domain, config: ModelConfig
-) -> list[float]:
+def y_probe_values_near_contour(
+    contour: ContourEstimate,
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    edge_focus: float = 0.0,
+) -> list[tuple[float, float]]:
     center_t = transformed_value(contour.y_c_pred, config.y_scale, "y")
     lower_t = transformed_value(domain.y_min, config.y_scale, "y")
     upper_t = transformed_value(domain.y_max, config.y_scale, "y")
@@ -798,10 +811,114 @@ def y_offsets_near_contour(
         clamp(contour.y_c_q95, domain.y_min, domain.y_max), config.y_scale, "y"
     )
     half_spread_t = max(abs(q95_t - q05_t) / 4.0, 0.025 * span_t)
+    offsets = [0.0, -half_spread_t, half_spread_t]
+    if edge_focus >= 0.25:
+        offsets.extend(
+            [
+                -2.0 * half_spread_t,
+                2.0 * half_spread_t,
+                -4.0 * half_spread_t,
+                4.0 * half_spread_t,
+            ]
+        )
+
+    probes: list[tuple[float, float]] = []
+    seen: set[float] = set()
+    for offset in offsets:
+        y_t = clamp(center_t + offset, lower_t, upper_t)
+        if any(abs(y_t - existing) <= span_t * 1e-9 for existing in seen):
+            continue
+        seen.add(y_t)
+        probes.append(
+            (
+                inverse_transformed_value(y_t, config.y_scale),
+                clamp(abs(offset) / max(0.10 * span_t, 1e-12), 0.0, 1.0),
+            )
+        )
+    return probes
+
+
+def y_offsets_near_contour(
+    contour: ContourEstimate, domain: Domain, config: ModelConfig
+) -> list[float]:
     return [
-        inverse_transformed_value(clamp(center_t + offset, lower_t, upper_t), config.y_scale)
-        for offset in (0.0, -half_spread_t, half_spread_t)
+        value
+        for value, _ in y_probe_values_near_contour(contour, domain, config)
     ]
+
+
+def candidate_y_values(
+    domain: Domain,
+    config: ModelConfig,
+    contour_path: Sequence[tuple[float, ContourEstimate]],
+    count: int,
+) -> list[float]:
+    lower = transformed_value(domain.y_min, config.y_scale, "y")
+    upper = transformed_value(domain.y_max, config.y_scale, "y")
+    span = max(upper - lower, 1e-12)
+    contour_values = [
+        transformed_value(contour.y_c_pred, config.y_scale, "y")
+        for _, contour in contour_path
+    ]
+    if contour_values:
+        lower = max(lower, min(contour_values) - 0.16 * span)
+        upper = min(upper, max(contour_values) + 0.16 * span)
+    return [
+        inverse_transformed_value(value, config.y_scale)
+        for value in linspace(lower, upper, max(count, 5))
+    ]
+
+
+def x_candidates_for_y_level(
+    y: float,
+    contour_path: Sequence[tuple[float, ContourEstimate]],
+    domain: Domain,
+    config: ModelConfig,
+) -> list[float]:
+    if not contour_path:
+        return []
+    y_t = transformed_value(y, config.y_scale, "y")
+    candidates: list[float] = []
+    ordered = sorted(contour_path, key=lambda item: item[0])
+    for (left_x, left_contour), (right_x, right_contour) in zip(ordered, ordered[1:]):
+        left_y = transformed_value(left_contour.y_c_pred, config.y_scale, "y")
+        right_y = transformed_value(right_contour.y_c_pred, config.y_scale, "y")
+        if abs(left_y - y_t) <= 1e-12:
+            candidates.append(left_x)
+            continue
+        if abs(right_y - y_t) <= 1e-12:
+            candidates.append(right_x)
+            continue
+        if (left_y - y_t) * (right_y - y_t) > 0:
+            continue
+        denominator = right_y - left_y
+        if abs(denominator) <= 1e-12:
+            continue
+        fraction = clamp((y_t - left_y) / denominator, 0.0, 1.0)
+        left_x_t = transformed_value(left_x, config.x_scale, "x")
+        right_x_t = transformed_value(right_x, config.x_scale, "x")
+        x_t = left_x_t + fraction * (right_x_t - left_x_t)
+        candidates.append(
+            inverse_transformed_value(
+                clamp(
+                    x_t,
+                    transformed_value(domain.x_min, config.x_scale, "x"),
+                    transformed_value(domain.x_max, config.x_scale, "x"),
+                ),
+                config.x_scale,
+            )
+        )
+
+    if candidates:
+        return sorted(set(candidates))
+
+    nearest_x, _ = min(
+        ordered,
+        key=lambda item: abs(
+            transformed_value(item[1].y_c_pred, config.y_scale, "y") - y_t
+        ),
+    )
+    return [nearest_x]
 
 
 def propose_new_points(
@@ -816,49 +933,94 @@ def propose_new_points(
     aggregates_by_coord = {(point.x, point.y): point for point in aggregates}
     proposals: list[Proposal] = []
     x_values = candidate_x_values(domain, aggregates, config, max(config.grid_size, count * 4))
+    contour_cache: dict[float, ContourEstimate] = {}
+
+    def contour_for(x: float) -> ContourEstimate:
+        if x not in contour_cache:
+            contour_cache[x] = contour_estimate(x, aggregates, domain, config, rng)
+        return contour_cache[x]
+
+    def add_candidate(
+        x: float,
+        y: float,
+        *,
+        source: str,
+        vertical_probe: float,
+    ) -> None:
+        n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
+        if n_existing:
+            return
+        contour = contour_for(x)
+        p_pred, p_std = predict_probability(x, y, contour, aggregates, config)
+        near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
+        novelty = clamp(
+            normalized_distance_to_existing(x, y, aggregates, domain, config) / 0.20,
+            0.0,
+            1.0,
+        )
+        gap = x_gap_score(x, aggregates, domain, config)
+        contour_uncertainty = contour_uncertainty_fraction(contour, domain, config)
+        edge_focus = boundary_focus(x, domain, config)
+        y_span = max(
+            transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"),
+            1e-12,
+        )
+        vertical_gap = abs(
+            transformed_value(y, config.y_scale, "y")
+            - transformed_value(contour.y_c_pred, config.y_scale, "y")
+        )
+        adaptive_vertical_probe = max(
+            vertical_probe,
+            clamp(vertical_gap / (0.10 * y_span), 0.0, 1.0),
+        )
+        inverse_locator = 1.0 if source == "x-from-y locator" else 0.0
+        score = (
+            0.30 * near_contour
+            + 0.22 * contour_uncertainty
+            + 0.17 * gap
+            + 0.13 * novelty
+            + 0.05 * p_std
+            + 0.08 * edge_focus
+            + 0.22 * edge_focus * adaptive_vertical_probe
+            + 0.08 * inverse_locator
+        )
+        reasons = ["new coordinate near predicted contour"]
+        if source == "x-from-y locator":
+            reasons.append("adaptive x-from-y locator")
+        if gap >= 0.25:
+            reasons.append("large gap in sampled x values")
+        if contour_uncertainty >= 0.05:
+            reasons.append("high local contour uncertainty")
+        if novelty >= 0.75:
+            reasons.append("away from existing coordinates")
+        if edge_focus >= 0.5 and adaptive_vertical_probe >= 0.5:
+            reasons.append("boundary bracket probe")
+        proposals.append(
+            Proposal(
+                x=x,
+                y=y,
+                proposal_type="new",
+                score=score,
+                p_positive_pred=p_pred,
+                contour=contour,
+                n_existing=0,
+                k_existing=0,
+                reason="; ".join(reasons),
+            )
+        )
 
     for x in x_values:
-        contour = contour_estimate(x, aggregates, domain, config, rng)
-        for y in y_offsets_near_contour(contour, domain, config):
-            n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
-            if n_existing:
-                continue
-            p_pred, p_std = predict_probability(x, y, contour, aggregates, config)
-            near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
-            novelty = clamp(
-                normalized_distance_to_existing(x, y, aggregates, domain, config) / 0.20,
-                0.0,
-                1.0,
-            )
-            gap = x_gap_score(x, aggregates, domain, config)
-            contour_uncertainty = contour_uncertainty_fraction(contour, domain, config)
-            score = (
-                0.35 * near_contour
-                + 0.25 * contour_uncertainty
-                + 0.20 * gap
-                + 0.15 * novelty
-                + 0.05 * p_std
-            )
-            reasons = ["new coordinate near predicted contour"]
-            if gap >= 0.25:
-                reasons.append("large gap in sampled x values")
-            if contour_uncertainty >= 0.05:
-                reasons.append("high local contour uncertainty")
-            if novelty >= 0.75:
-                reasons.append("away from existing coordinates")
-            proposals.append(
-                Proposal(
-                    x=x,
-                    y=y,
-                    proposal_type="new",
-                    score=score,
-                    p_positive_pred=p_pred,
-                    contour=contour,
-                    n_existing=0,
-                    k_existing=0,
-                    reason="; ".join(reasons),
-                )
-            )
+        contour = contour_for(x)
+        edge_focus = boundary_focus(x, domain, config)
+        for y, vertical_probe in y_probe_values_near_contour(
+            contour, domain, config, edge_focus=edge_focus
+        ):
+            add_candidate(x, y, source="y-from-x locator", vertical_probe=vertical_probe)
+
+    contour_path = [(x, contour_for(x)) for x in x_values]
+    for y in candidate_y_values(domain, config, contour_path, max(config.grid_size, count * 3)):
+        for x in x_candidates_for_y_level(y, contour_path, domain, config):
+            add_candidate(x, y, source="x-from-y locator", vertical_probe=0.0)
 
     proposals.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
     selected: list[Proposal] = []

@@ -64,6 +64,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "preview_grid_size": 61,
     "preview_every": 10,
     "preview_posterior_samples": 0,
+    "convergence_sse_tolerance": 0.0005,
+    "convergence_patience": 3,
+    "convergence_min_iterations": 30,
+    "convergence_mode": "both",
     "delay": 0.04,
 }
 PARAM_TYPES = {
@@ -87,6 +91,10 @@ PARAM_TYPES = {
     "preview_grid_size": int,
     "preview_every": int,
     "preview_posterior_samples": int,
+    "convergence_sse_tolerance": float,
+    "convergence_patience": int,
+    "convergence_min_iterations": int,
+    "convergence_mode": str,
     "delay": float,
 }
 
@@ -211,6 +219,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=defaults["preview_posterior_samples"],
     )
+    parser.add_argument(
+        "--convergence-sse-tolerance",
+        type=float,
+        default=defaults["convergence_sse_tolerance"],
+        help="Stop early when contour SSE remains below this value. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--convergence-patience",
+        type=int,
+        default=defaults["convergence_patience"],
+        help="Number of consecutive convergence checks required before stopping.",
+    )
+    parser.add_argument(
+        "--convergence-min-iterations",
+        type=int,
+        default=defaults["convergence_min_iterations"],
+        help="Minimum completed sweeps before convergence stopping is allowed.",
+    )
+    parser.add_argument(
+        "--convergence-mode",
+        choices=["y", "x", "both"],
+        default=defaults["convergence_mode"],
+        help="Compare Y(x), X(y), or both transformed contour views.",
+    )
     parser.add_argument("--delay", type=float, default=defaults["delay"])
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--output-dir", type=Path)
@@ -265,6 +297,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--preview-every must be at least 1")
     if args.preview_posterior_samples < 0:
         raise ValueError("--preview-posterior-samples cannot be negative")
+    if args.convergence_sse_tolerance < 0:
+        raise ValueError("--convergence-sse-tolerance cannot be negative")
+    if args.convergence_patience < 1:
+        raise ValueError("--convergence-patience must be at least 1")
+    if args.convergence_min_iterations < 0:
+        raise ValueError("--convergence-min-iterations cannot be negative")
     if args.delay < 0:
         raise ValueError("--delay cannot be negative")
 
@@ -564,6 +602,79 @@ def write_preview_contour(path: Path, contour: Sequence[dict[str, float]]) -> No
             for row in contour
         ],
     )
+
+
+def interpolate_contour_x_at_y(
+    contour: Sequence[dict[str, float]], y_value: float, domain: Domain
+) -> float:
+    valid = sorted(
+        (
+            row
+            for row in contour
+            if row.get("Rr", 0) > 0 and row.get("y_c_pred", 0) > 0
+        ),
+        key=lambda row: row["Rr"],
+    )
+    if not valid:
+        return domain.rr_min
+    target_y = scaled_value(y_value, domain.oh_scale)
+    candidates: list[float] = []
+    for left, right in zip(valid, valid[1:]):
+        left_y = scaled_value(left["y_c_pred"], domain.oh_scale)
+        right_y = scaled_value(right["y_c_pred"], domain.oh_scale)
+        if abs(left_y - target_y) <= 1e-12:
+            candidates.append(left["Rr"])
+            continue
+        if abs(right_y - target_y) <= 1e-12:
+            candidates.append(right["Rr"])
+            continue
+        if (left_y - target_y) * (right_y - target_y) > 0:
+            continue
+        denominator = right_y - left_y
+        if abs(denominator) <= 1e-12:
+            continue
+        fraction = max(0.0, min(1.0, (target_y - left_y) / denominator))
+        left_x = scaled_value(left["Rr"], domain.rr_scale)
+        right_x = scaled_value(right["Rr"], domain.rr_scale)
+        candidates.append(inverse_scaled_value(left_x + fraction * (right_x - left_x), domain.rr_scale))
+    if candidates:
+        return sorted(candidates)[len(candidates) // 2]
+    nearest = min(
+        valid,
+        key=lambda row: abs(scaled_value(row["y_c_pred"], domain.oh_scale) - target_y),
+    )
+    return nearest["Rr"]
+
+
+def contour_sse(
+    previous: Sequence[dict[str, float]],
+    current: Sequence[dict[str, float]],
+    domain: Domain,
+    mode: str,
+) -> float | None:
+    if not previous or not current:
+        return None
+    total = 0.0
+    if mode in {"y", "both"}:
+        for before, after in zip(previous, current):
+            before_y = before.get("y_c_pred", 0)
+            after_y = after.get("y_c_pred", 0)
+            if before_y <= 0 or after_y <= 0:
+                continue
+            delta = scaled_value(after_y, domain.oh_scale) - scaled_value(before_y, domain.oh_scale)
+            total += delta * delta
+    if mode in {"x", "both"}:
+        points = min(len(previous), len(current))
+        if points < 2:
+            return total
+        for index in range(points):
+            fraction = index / (points - 1)
+            y_value = value_at_fraction(domain.oh_min, domain.oh_max, fraction, domain.oh_scale)
+            before_x = interpolate_contour_x_at_y(previous, y_value, domain)
+            after_x = interpolate_contour_x_at_y(current, y_value, domain)
+            delta = scaled_value(after_x, domain.rr_scale) - scaled_value(before_x, domain.rr_scale)
+            total += delta * delta
+    return total
 
 
 def write_state(output_dir: Path, state: dict[str, Any]) -> None:
@@ -1186,8 +1297,9 @@ function draw() {
   drawGrid(state, s);
   drawBand(state.contour || [], s);
   drawLine(state.true_contour || [], s, "Rr", "Oh", "#26313d", 2, true);
-  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#2e63d3", 3.2, false);
   drawPoints(state, s);
+  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#ffffff", 6.4, false);
+  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#2e63d3", 3.2, false);
   drawPlotSummary(state, s);
 }
 
@@ -1361,23 +1473,11 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     sleep_if_requested(args.delay)
 
     preview_contour: list[dict[str, float]] = []
+    previous_convergence_contour: list[dict[str, float]] = []
+    stable_convergence_checks = 0
+    completed_iterations = 0
+    stopped_for_convergence = False
     for iteration in range(1, args.iterations + 1):
-        proposed_path = output_dir / f"Sweep-{iteration}_proposed.csv"
-        proposal_rows = run_proposal(
-            completed_files,
-            proposed_path,
-            domain,
-            n_simulations=args.batch_size,
-            seed=args.seed + iteration,
-            grid_size=args.grid_size,
-            posterior_samples=args.posterior_samples,
-            length_scale_x=args.length_scale_x,
-            length_scale_y=args.length_scale_y,
-            n_new=args.n_new,
-            n_repeats=args.n_repeats,
-        )
-        proposals = [proposal_from_row(row) for row in proposal_rows]
-
         should_refresh_preview = (
             iteration == 1
             or iteration == args.iterations
@@ -1396,6 +1496,51 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 seed=args.seed + 10_000 + iteration,
             )
             write_preview_contour(preview_path, preview_contour)
+            if (
+                args.convergence_sse_tolerance > 0
+                and previous_convergence_contour
+                and completed_iterations >= args.convergence_min_iterations
+            ):
+                sse = contour_sse(
+                    previous_convergence_contour,
+                    preview_contour,
+                    domain,
+                    args.convergence_mode,
+                )
+                if sse is not None and sse <= args.convergence_sse_tolerance:
+                    stable_convergence_checks += 1
+                else:
+                    stable_convergence_checks = 0
+                if sse is not None:
+                    messages.append(
+                        "Contour convergence SSE "
+                        f"{sse:.3g} ({stable_convergence_checks}/"
+                        f"{args.convergence_patience})."
+                    )
+                if stable_convergence_checks >= args.convergence_patience:
+                    stopped_for_convergence = True
+                    messages.append(
+                        "Stopped early: learned contour change stayed below "
+                        f"{args.convergence_sse_tolerance:g}."
+                    )
+                    break
+            previous_convergence_contour = list(preview_contour)
+
+        proposed_path = output_dir / f"Sweep-{iteration}_proposed.csv"
+        proposal_rows = run_proposal(
+            completed_files,
+            proposed_path,
+            domain,
+            n_simulations=args.batch_size,
+            seed=args.seed + iteration,
+            grid_size=args.grid_size,
+            posterior_samples=args.posterior_samples,
+            length_scale_x=args.length_scale_x,
+            length_scale_y=args.length_scale_y,
+            n_new=args.n_new,
+            n_repeats=args.n_repeats,
+        )
+        proposals = [proposal_from_row(row) for row in proposal_rows]
 
         new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
         repeat_proposals = len(proposals) - new_proposals
@@ -1486,13 +1631,18 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             history=history,
             messages=messages,
         )
+        completed_iterations = iteration
         sleep_if_requested(args.delay)
 
-    messages.append("Campaign complete.")
+    messages.append(
+        "Campaign stopped after contour convergence."
+        if stopped_for_convergence
+        else "Campaign complete."
+    )
     update_visual_state(
         output_dir,
-        status="complete",
-        iteration=args.iterations,
+        status="converged" if stopped_for_convergence else "complete",
+        iteration=completed_iterations,
         total_iterations=args.iterations,
         batch_size=args.batch_size,
         domain=domain,

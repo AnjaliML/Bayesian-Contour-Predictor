@@ -71,6 +71,51 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
             self.assertTrue(state["true_contour"])
             self.assertTrue(state["contour"])
 
+    def test_visualizer_can_stop_after_contour_convergence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "visualizer-converged"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--iterations",
+                    "5",
+                    "--initial-points",
+                    "4",
+                    "--batch-size",
+                    "3",
+                    "--preview-points",
+                    "4",
+                    "--preview-grid-size",
+                    "5",
+                    "--preview-every",
+                    "1",
+                    "--grid-size",
+                    "5",
+                    "--posterior-samples",
+                    "0",
+                    "--convergence-sse-tolerance",
+                    "999",
+                    "--convergence-patience",
+                    "1",
+                    "--convergence-min-iterations",
+                    "1",
+                    "--delay",
+                    "0",
+                    "--no-server",
+                    "--no-browser",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+                check=True,
+            )
+
+            state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(state["status"], "converged")
+            self.assertLess(state["iteration"], state["total_iterations"])
+            self.assertTrue(state["contour"])
+
 
 if __name__ == "__main__":
     unittest.main()

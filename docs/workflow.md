@@ -49,7 +49,8 @@ Useful options:
 ```bash
 python3 end-to-end-with-visualization-drop-injection.py \
   --iterations 120 \
-  --batch-size 8 \
+  --batch-size 16 \
+  --n-repeats 3 \
   --delay 0.04 \
   --seed 22
 ```
@@ -125,3 +126,10 @@ Common stopping checks:
 - Repeated labels near the contour are statistically stable.
 - New proposed points stop moving the inferred contour.
 - The contour resolution is fine enough for the downstream paper or design use.
+
+The visualizer can stop automatically before `iterations` is exhausted. It
+compares consecutive learned contours on the preview grid and stops when the
+transformed SSE stays below `convergence_sse_tolerance` for
+`convergence_patience` checks after `convergence_min_iterations` sweeps. Set
+`convergence_sse_tolerance = 0` to disable this early stop. `convergence_mode`
+can compare `y`, inverse `x`, or `both` views of the contour.

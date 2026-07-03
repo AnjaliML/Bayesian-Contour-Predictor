@@ -245,6 +245,65 @@ class ProposeNextSweepTests(unittest.TestCase):
         self.assertLess(estimate, 0.008)
         self.assertNotAlmostEqual(estimate, 0.01)
 
+    def test_boundary_focus_adds_wider_y_bracket_probes(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.10,
+            label_noise=0.02,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=5,
+            posterior_samples=0,
+        )
+        contour = sweep.ContourEstimate(
+            y_c_pred=0.006,
+            y_c_q05=0.006,
+            y_c_q95=0.006,
+            y_c_std=0.0,
+        )
+
+        interior = sweep.y_probe_values_near_contour(
+            contour, domain, config, edge_focus=0.0
+        )
+        boundary = sweep.y_probe_values_near_contour(
+            contour, domain, config, edge_focus=1.0
+        )
+
+        self.assertGreater(len(boundary), len(interior))
+        self.assertLess(min(value for value, _ in boundary), min(value for value, _ in interior))
+
+    def test_inverse_locator_clamps_y_outside_contour_to_nearest_x_edge(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.10,
+            label_noise=0.02,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=5,
+            posterior_samples=0,
+        )
+        contour_path = [
+            (1.0, sweep.ContourEstimate(0.006, 0.006, 0.006, 0.0)),
+            (10.0, sweep.ContourEstimate(0.03, 0.03, 0.03, 0.0)),
+            (100.0, sweep.ContourEstimate(0.032, 0.032, 0.032, 0.0)),
+        ]
+
+        candidates = sweep.x_candidates_for_y_level(0.004, contour_path, domain, config)
+
+        self.assertEqual(candidates, [1.0])
+
     def test_log_x_scale_uses_geometric_candidate_spacing(self):
         domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
         aggregates = [
