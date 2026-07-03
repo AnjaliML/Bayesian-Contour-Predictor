@@ -218,6 +218,33 @@ class ProposeNextSweepTests(unittest.TestCase):
 
         self.assertGreater(low_y, high_y)
 
+    def test_monotone_contour_refines_between_grid_points(self):
+        domain = sweep.Domain(x_min=0.0, x_max=1.0, y_min=0.001, y_max=0.1)
+        aggregates = [
+            sweep.AggregatePoint(x=0.5, y=0.006, n=1, k=1),
+            sweep.AggregatePoint(x=0.5, y=0.008, n=1, k=0),
+        ]
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            x_scale="linear",
+            y_scale="log10",
+            transition_width=0.05,
+            label_noise=0.02,
+            length_scale_x=1.0,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=5,
+            posterior_samples=0,
+        )
+
+        estimate = sweep.estimate_monotone_y_c(0.5, aggregates, domain, config)
+
+        self.assertGreater(estimate, 0.006)
+        self.assertLess(estimate, 0.008)
+        self.assertNotAlmostEqual(estimate, 0.01)
+
     def test_log_x_scale_uses_geometric_candidate_spacing(self):
         domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
         aggregates = [

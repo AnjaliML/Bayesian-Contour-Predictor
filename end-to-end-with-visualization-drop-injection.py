@@ -36,12 +36,19 @@ def optional_int(value: str) -> int | None:
     return int(value)
 
 
+def optional_float(value: str) -> float | None:
+    normalized = value.strip().lower()
+    if normalized in {"auto", "default", "none", ""}:
+        return None
+    return float(value)
+
+
 DEFAULT_PARAMS: dict[str, Any] = {
-    "iterations": 60,
+    "iterations": 120,
     "initial_points": 20,
-    "batch_size": 8,
+    "batch_size": 16,
     "n_new": None,
-    "n_repeats": None,
+    "n_repeats": 3,
     "seed": 11,
     "rr_min": 1.0,
     "rr_max": 100.0,
@@ -51,6 +58,8 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "oh_scale": "log10",
     "grid_size": 15,
     "posterior_samples": 0,
+    "length_scale_x": 0.18,
+    "length_scale_y": None,
     "preview_points": 120,
     "preview_grid_size": 61,
     "preview_every": 10,
@@ -72,6 +81,8 @@ PARAM_TYPES = {
     "oh_scale": str,
     "grid_size": int,
     "posterior_samples": int,
+    "length_scale_x": optional_float,
+    "length_scale_y": optional_float,
     "preview_points": int,
     "preview_grid_size": int,
     "preview_every": int,
@@ -190,6 +201,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--oh-scale", choices=["linear", "log10"], default=defaults["oh_scale"])
     parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
     parser.add_argument("--posterior-samples", type=int, default=defaults["posterior_samples"])
+    parser.add_argument("--length-scale-x", type=optional_float, default=defaults["length_scale_x"])
+    parser.add_argument("--length-scale-y", type=optional_float, default=defaults["length_scale_y"])
     parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
     parser.add_argument("--preview-grid-size", type=int, default=defaults["preview_grid_size"])
     parser.add_argument("--preview-every", type=int, default=defaults["preview_every"])
@@ -240,6 +253,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grid-size must be at least 5")
     if args.posterior_samples < 0:
         raise ValueError("--posterior-samples cannot be negative")
+    if args.length_scale_x is not None and args.length_scale_x <= 0:
+        raise ValueError("--length-scale-x must be positive or auto")
+    if args.length_scale_y is not None and args.length_scale_y <= 0:
+        raise ValueError("--length-scale-y must be positive or auto")
     if args.preview_points < 2:
         raise ValueError("--preview-points must be at least 2")
     if args.preview_grid_size < 5:
@@ -352,6 +369,8 @@ def run_proposal(
     seed: int,
     grid_size: int,
     posterior_samples: int,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
     n_new: int | None = None,
     n_repeats: int | None = None,
 ) -> list[dict[str, str]]:
@@ -394,6 +413,10 @@ def run_proposal(
         command.extend(["--n-new", str(n_new)])
     if n_repeats is not None:
         command.extend(["--n-repeats", str(n_repeats)])
+    if length_scale_x is not None:
+        command.extend(["--length-scale-x", format_float(length_scale_x)])
+    if length_scale_y is not None:
+        command.extend(["--length-scale-y", format_float(length_scale_y)])
     subprocess.run(command, check=True)
     return read_csv(outfile)
 
@@ -444,7 +467,13 @@ def find_true_contour(domain: Domain, samples: int = 80) -> list[dict[str, float
     return contour
 
 
-def model_preview_config(domain: Domain, grid_size: int, posterior_samples: int) -> sweep.ModelConfig:
+def model_preview_config(
+    domain: Domain,
+    grid_size: int,
+    posterior_samples: int,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
+) -> sweep.ModelConfig:
     model_domain = sweep.Domain(
         x_min=domain.rr_min,
         x_max=domain.rr_max,
@@ -458,12 +487,12 @@ def model_preview_config(domain: Domain, grid_size: int, posterior_samples: int)
         y_scale=domain.oh_scale,
         transition_width=0.10,
         label_noise=0.02,
-        length_scale_x=sweep.default_length_scale(
+        length_scale_x=length_scale_x or sweep.default_length_scale(
             sweep.transformed_span(
                 model_domain.x_min, model_domain.x_max, domain.rr_scale, "x"
             )
         ),
-        length_scale_y=sweep.default_length_scale(
+        length_scale_y=length_scale_y or sweep.default_length_scale(
             sweep.transformed_span(
                 model_domain.y_min, model_domain.y_max, domain.oh_scale, "y"
             )
@@ -482,6 +511,8 @@ def build_model_preview_contour(
     points: int,
     grid_size: int,
     posterior_samples: int,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
     seed: int,
 ) -> list[dict[str, float]]:
     observations, _ = sweep.read_csv_files(
@@ -497,7 +528,9 @@ def build_model_preview_contour(
         y_min=domain.oh_min,
         y_max=domain.oh_max,
     )
-    config = model_preview_config(domain, grid_size, posterior_samples)
+    config = model_preview_config(
+        domain, grid_size, posterior_samples, length_scale_x, length_scale_y
+    )
     aggregates = sweep.aggregate_observations(observations)
     rng = random.Random(seed)
 
@@ -1338,6 +1371,8 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             seed=args.seed + iteration,
             grid_size=args.grid_size,
             posterior_samples=args.posterior_samples,
+            length_scale_x=args.length_scale_x,
+            length_scale_y=args.length_scale_y,
             n_new=args.n_new,
             n_repeats=args.n_repeats,
         )
@@ -1356,6 +1391,8 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 points=args.preview_points,
                 grid_size=args.preview_grid_size,
                 posterior_samples=args.preview_posterior_samples,
+                length_scale_x=args.length_scale_x,
+                length_scale_y=args.length_scale_y,
                 seed=args.seed + 10_000 + iteration,
             )
             write_preview_contour(preview_path, preview_contour)

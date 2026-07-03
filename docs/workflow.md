@@ -63,13 +63,14 @@ default. This avoids the slowdown caused by recomputing a dense display-only
 contour on every iteration as the campaign grows.
 
 Each visualizer sweep runs `batch_size` simulations. With the default
-`batch_size = 8`, the proposal engine chooses 5 new coordinates and 3 repeat
-coordinates. Set `n_new` and `n_repeats` in `explore.params` to pin that split,
-or leave them as `auto` to let `propose_next_sweep.py` choose.
+`batch_size = 16` and `n_repeats = 3`, the proposal engine chooses 13 new
+coordinates and 3 repeat coordinates. Set `n_new` and `n_repeats` in
+`explore.params` to pin that split, or leave them as `auto` to let
+`propose_next_sweep.py` choose.
 
 The campaign has no hard cap on completed data points: total completed runs are
-`initial_points + iterations * batch_size`. For example, 60 sweeps at the
-default settings gives 500 completed runs, while 600 sweeps would give 4,820.
+`initial_points + iterations * batch_size`. For example, 120 sweeps at the
+default settings gives 1,940 completed runs, while 600 sweeps would give 9,620.
 For speed, repeat scoring preselects about 50 informative existing coordinates
 once the dataset is larger than that; model fitting and new-point scoring still
 use the completed observations.
@@ -82,9 +83,10 @@ do not change which experiments are proposed.
 
 Near a lower log-scale boundary such as `x = 1`, prefer more points per sweep
 or a denser display preview before jumping straight to hundreds of sweeps. A
-typical refinement run is `--iterations 120 --batch-size 16 --n-repeats 3`,
+typical refinement run is the default `--iterations 120 --batch-size 16 --n-repeats 3`,
 which spends most of the extra budget on new coordinates while keeping a few
-noise-check repeats.
+noise-check repeats. The visualizer also sets `length_scale_x = 0.18` by default,
+which reduces over-smoothing near the lower log-scale edge.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.

@@ -3,11 +3,11 @@
 # Command-line flags override these values.
 
 seed = 11
-iterations = 60
+iterations = 120
 initial_points = 20
-batch_size = 8
+batch_size = 16
 n_new = auto
-n_repeats = auto
+n_repeats = 3
 
 # Parameter-space bounds from the drop-injection regime map.
 rr_min = 1
@@ -22,6 +22,8 @@ oh_scale = log10
 # Increase it when uncertainty bands matter more than run speed.
 grid_size = 15
 posterior_samples = 0
+length_scale_x = 0.18
+length_scale_y = auto
 preview_points = 120
 preview_grid_size = 61
 preview_every = 10

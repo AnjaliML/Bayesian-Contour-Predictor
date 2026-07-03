@@ -11,7 +11,7 @@ import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 PROPOSAL_COLUMNS = [
@@ -224,6 +224,42 @@ def linspace(lower: float, upper: float, count: int) -> list[float]:
     return [lower + step * i for i in range(count)]
 
 
+def minimize_bounded(
+    objective: Callable[[float], float],
+    lower: float,
+    upper: float,
+    *,
+    iterations: int = 18,
+) -> float:
+    if lower >= upper:
+        return lower
+    inv_phi = (math.sqrt(5.0) - 1.0) / 2.0
+    inv_phi_sq = (3.0 - math.sqrt(5.0)) / 2.0
+    left = lower
+    right = upper
+    h = right - left
+    c = left + inv_phi_sq * h
+    d = left + inv_phi * h
+    fc = objective(c)
+    fd = objective(d)
+    for _ in range(iterations):
+        if fc < fd:
+            right = d
+            d = c
+            fd = fc
+            h = inv_phi * h
+            c = left + inv_phi_sq * h
+            fc = objective(c)
+        else:
+            left = c
+            c = d
+            fc = fd
+            h = inv_phi * h
+            d = left + inv_phi * h
+            fd = objective(d)
+    return (left + right) / 2.0
+
+
 def transformed_value(value: float, scale: str, axis_name: str) -> float:
     if scale == "linear":
         return value
@@ -410,14 +446,27 @@ def estimate_monotone_y_c(
     upper = transformed_y(domain.y_max, config.y_scale)
     candidates_t = linspace(lower, upper, max(config.grid_size, 5))
     weighted_points = weighted_points_for_x(x, aggregates, config)
-    best_t = min(
-        candidates_t,
-        key=lambda value: monotone_negative_log_likelihood_weighted(
+    losses = [
+        monotone_negative_log_likelihood_weighted(
+            inverse_transformed_y(value, config.y_scale),
+            weighted_points,
+            config,
+            sampled_rates=sampled_rates,
+        )
+        for value in candidates_t
+    ]
+    best_index = min(range(len(candidates_t)), key=lambda index: losses[index])
+    bracket_lower = candidates_t[max(0, best_index - 1)]
+    bracket_upper = candidates_t[min(len(candidates_t) - 1, best_index + 1)]
+    best_t = minimize_bounded(
+        lambda value: monotone_negative_log_likelihood_weighted(
             inverse_transformed_y(value, config.y_scale),
             weighted_points,
             config,
             sampled_rates=sampled_rates,
         ),
+        bracket_lower,
+        bracket_upper,
     )
     return inverse_transformed_y(best_t, config.y_scale)
 
