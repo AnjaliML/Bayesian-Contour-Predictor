@@ -41,6 +41,17 @@ For positive `y` values, use:
 This matches the drop-injection use case where increasing `Oh` suppresses
 droplets.
 
+For domains where the first coordinate spans orders of magnitude, use:
+
+```bash
+--x-scale log10
+```
+
+This makes kernel distances, sampled gaps, candidate coordinates, and novelty
+scores operate in log space. In the drop-injection map this gives the low-`Rr`
+region near `Rr = 1` meaningful resolution instead of letting the high end of a
+linear `Rr` interval dominate the acquisition geometry.
+
 Use `--monotone-direction increasing` when the positive regime becomes more
 likely as `y` increases.
 

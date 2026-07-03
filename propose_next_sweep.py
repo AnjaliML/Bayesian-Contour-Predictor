@@ -73,6 +73,7 @@ class Domain:
 class ModelConfig:
     mode: str
     monotone_direction: str
+    x_scale: str
     y_scale: str
     transition_width: float
     label_noise: float
@@ -223,18 +224,38 @@ def linspace(lower: float, upper: float, count: int) -> list[float]:
     return [lower + step * i for i in range(count)]
 
 
-def transformed_y(value: float, scale: str) -> float:
+def transformed_value(value: float, scale: str, axis_name: str) -> float:
     if scale == "linear":
         return value
     if value <= 0:
-        raise ValueError("--y-scale log10 requires all y values and y bounds to be positive")
+        raise ValueError(
+            f"--{axis_name}-scale log10 requires all {axis_name} values and bounds to be positive"
+        )
     return math.log10(value)
 
 
-def inverse_transformed_y(value: float, scale: str) -> float:
+def inverse_transformed_value(value: float, scale: str) -> float:
     if scale == "linear":
         return value
     return 10**value
+
+
+def transformed_x(value: float, config: ModelConfig) -> float:
+    return transformed_value(value, config.x_scale, "x")
+
+
+def transformed_y(value: float, scale: str) -> float:
+    return transformed_value(value, scale, "y")
+
+
+def inverse_transformed_y(value: float, scale: str) -> float:
+    return inverse_transformed_value(value, scale)
+
+
+def transformed_span(lower: float, upper: float, scale: str, axis_name: str) -> float:
+    return transformed_value(upper, scale, axis_name) - transformed_value(
+        lower, scale, axis_name
+    )
 
 
 def logistic(value: float) -> float:
@@ -261,8 +282,14 @@ def kernel_predict(
     weighted_k = 0.0
     weighted_n = 0.0
     for point in aggregates:
-        weight_x = normal_weight(x - point.x, config.length_scale_x)
-        weight_y = normal_weight(y - point.y, config.length_scale_y)
+        weight_x = normal_weight(
+            transformed_x(x, config) - transformed_x(point.x, config),
+            config.length_scale_x,
+        )
+        weight_y = normal_weight(
+            transformed_y(y, config.y_scale) - transformed_y(point.y, config.y_scale),
+            config.length_scale_y,
+        )
         weight = weight_x * weight_y
         rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
         weighted_k += weight * point.n * rate
@@ -305,9 +332,54 @@ def monotone_negative_log_likelihood(
 ) -> float:
     loss = 0.0
     for point in aggregates:
-        weight = normal_weight(x - point.x, config.length_scale_x)
+        weight = normal_weight(
+            transformed_x(x, config) - transformed_x(point.x, config),
+            config.length_scale_x,
+        )
         if weight < 1e-9:
             continue
+        rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
+        k = point.n * rate
+        p = clamp(
+            monotone_probability(
+                point.y,
+                y_c,
+                direction=config.monotone_direction,
+                y_scale=config.y_scale,
+                transition_width=config.transition_width,
+                label_noise=config.label_noise,
+            ),
+            1e-9,
+            1.0 - 1e-9,
+        )
+        loss -= weight * (k * math.log(p) + (point.n - k) * math.log(1.0 - p))
+    return loss
+
+
+def weighted_points_for_x(
+    x: float, aggregates: Sequence[AggregatePoint], config: ModelConfig
+) -> list[tuple[AggregatePoint, float]]:
+    x_t = transformed_x(x, config)
+    weighted: list[tuple[AggregatePoint, float]] = []
+    for point in aggregates:
+        weight = normal_weight(
+            x_t - transformed_x(point.x, config),
+            config.length_scale_x,
+        )
+        if weight >= 1e-9:
+            weighted.append((point, weight))
+    return weighted
+
+
+def monotone_negative_log_likelihood_weighted(
+    y_c: float,
+    weighted_points: Sequence[tuple[AggregatePoint, float]],
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    loss = 0.0
+    for point, weight in weighted_points:
         rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
         k = point.n * rate
         p = clamp(
@@ -337,12 +409,12 @@ def estimate_monotone_y_c(
     lower = transformed_y(domain.y_min, config.y_scale)
     upper = transformed_y(domain.y_max, config.y_scale)
     candidates_t = linspace(lower, upper, max(config.grid_size, 5))
+    weighted_points = weighted_points_for_x(x, aggregates, config)
     best_t = min(
         candidates_t,
-        key=lambda value: monotone_negative_log_likelihood(
-            x,
+        key=lambda value: monotone_negative_log_likelihood_weighted(
             inverse_transformed_y(value, config.y_scale),
-            aggregates,
+            weighted_points,
             config,
             sampled_rates=sampled_rates,
         ),
@@ -358,7 +430,12 @@ def estimate_generic_y_c(
     *,
     sampled_rates: dict[tuple[float, float], float] | None = None,
 ) -> float:
-    y_values = linspace(domain.y_min, domain.y_max, max(config.grid_size, 5))
+    lower = transformed_y(domain.y_min, config.y_scale)
+    upper = transformed_y(domain.y_max, config.y_scale)
+    y_values = [
+        inverse_transformed_y(value, config.y_scale)
+        for value in linspace(lower, upper, max(config.grid_size, 5))
+    ]
     return min(
         y_values,
         key=lambda y: abs(
@@ -472,27 +549,46 @@ def exact_existing_counts(
 
 
 def normalized_distance_to_existing(
-    x: float, y: float, aggregates: Sequence[AggregatePoint], domain: Domain
+    x: float,
+    y: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
 ) -> float:
-    scale_x = domain.x_span or 1.0
-    scale_y = domain.y_span or 1.0
+    scale_x = transformed_span(domain.x_min, domain.x_max, config.x_scale, "x") or 1.0
+    scale_y = transformed_span(domain.y_min, domain.y_max, config.y_scale, "y") or 1.0
+    x_t = transformed_x(x, config)
+    y_t = transformed_y(y, config.y_scale)
     return min(
-        math.hypot((x - point.x) / scale_x, (y - point.y) / scale_y)
+        math.hypot(
+            (x_t - transformed_x(point.x, config)) / scale_x,
+            (y_t - transformed_y(point.y, config.y_scale)) / scale_y,
+        )
         for point in aggregates
     )
 
 
-def x_gap_score(x: float, aggregates: Sequence[AggregatePoint], domain: Domain) -> float:
+def x_gap_score(
+    x: float, aggregates: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
+) -> float:
     xs = sorted({point.x for point in aggregates})
     if not xs:
         return 1.0
-    augmented = [domain.x_min, *xs, domain.x_max]
+    augmented = [
+        transformed_value(value, config.x_scale, "x")
+        for value in [domain.x_min, *xs, domain.x_max]
+    ]
+    x_t = transformed_x(x, config)
     containing_gap = 0.0
     for left, right in zip(augmented, augmented[1:]):
-        if left <= x <= right:
+        if left <= x_t <= right:
             containing_gap = max(containing_gap, right - left)
-    nearest_x_distance = min(abs(x - existing_x) for existing_x in xs)
-    return clamp(max(containing_gap, nearest_x_distance) / max(domain.x_span, 1e-12), 0.0, 1.0)
+    nearest_x_distance = min(
+        abs(x_t - transformed_value(existing_x, config.x_scale, "x"))
+        for existing_x in xs
+    )
+    x_span = transformed_span(domain.x_min, domain.x_max, config.x_scale, "x")
+    return clamp(max(containing_gap, nearest_x_distance) / max(x_span, 1e-12), 0.0, 1.0)
 
 
 def choose_batch_counts(
@@ -516,6 +612,26 @@ def choose_batch_counts(
     return n_simulations - repeats, repeats
 
 
+def repeat_candidate_points(
+    aggregates: Sequence[AggregatePoint], requested_count: int
+) -> list[AggregatePoint]:
+    if len(aggregates) <= 50:
+        return list(aggregates)
+    limit = max(50, requested_count * 16)
+
+    def cheap_repeat_score(point: AggregatePoint) -> tuple[float, float, float]:
+        disagreement = 1.0 - min(1.0, abs(point.rate - 0.5) * 2.0)
+        low_repeat = 1.0 / max(point.n, 1)
+        single_run = 1.0 if point.n == 1 else 0.0
+        return (
+            0.55 * disagreement + 0.35 * low_repeat + 0.10 * single_run,
+            -point.n,
+            point.x,
+        )
+
+    return sorted(aggregates, key=cheap_repeat_score, reverse=True)[:limit]
+
+
 def propose_repeats(
     aggregates: Sequence[AggregatePoint],
     domain: Domain,
@@ -524,13 +640,16 @@ def propose_repeats(
     count: int,
 ) -> list[Proposal]:
     proposals: list[Proposal] = []
-    for point in aggregates:
-        contour = contour_estimate(point.x, aggregates, domain, config, rng)
+    contour_cache: dict[float, ContourEstimate] = {}
+    for point in repeat_candidate_points(aggregates, count):
+        if point.x not in contour_cache:
+            contour_cache[point.x] = contour_estimate(point.x, aggregates, domain, config, rng)
+        contour = contour_cache[point.x]
         p_pred, p_std = predict_probability(point.x, point.y, contour, aggregates, config)
         near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
         disagreement = 1.0 - min(1.0, abs(point.rate - 0.5) * 2.0)
         low_repeat = 1.0 / max(point.n, 1)
-        contour_uncertainty = clamp(contour.y_c_std / max(domain.y_span, 1e-12), 0.0, 1.0)
+        contour_uncertainty = contour_uncertainty_fraction(contour, domain, config)
         score = (
             0.35 * near_contour
             + 0.30 * disagreement
@@ -567,16 +686,73 @@ def propose_repeats(
     return proposals[:count]
 
 
-def candidate_x_values(domain: Domain, aggregates: Sequence[AggregatePoint], count: int) -> list[float]:
-    base = linspace(domain.x_min, domain.x_max, count)
+def candidate_x_values(
+    domain: Domain, aggregates: Sequence[AggregatePoint], config: ModelConfig, count: int
+) -> list[float]:
+    lower = transformed_value(domain.x_min, config.x_scale, "x")
+    upper = transformed_value(domain.x_max, config.x_scale, "x")
+    base = [inverse_transformed_value(value, config.x_scale) for value in linspace(lower, upper, count)]
     xs = sorted({point.x for point in aggregates})
-    midpoints = [(left + right) / 2.0 for left, right in zip(xs, xs[1:])]
+    midpoints = [
+        inverse_transformed_value(
+            (
+                transformed_value(left, config.x_scale, "x")
+                + transformed_value(right, config.x_scale, "x")
+            )
+            / 2.0,
+            config.x_scale,
+        )
+        for left, right in zip(xs, xs[1:])
+    ]
     values = [*base, *midpoints]
     deduped: list[float] = []
+    x_span = transformed_span(domain.x_min, domain.x_max, config.x_scale, "x")
     for value in sorted(values):
-        if not deduped or abs(value - deduped[-1]) > domain.x_span * 1e-9:
+        if (
+            not deduped
+            or abs(
+                transformed_value(value, config.x_scale, "x")
+                - transformed_value(deduped[-1], config.x_scale, "x")
+            )
+            > x_span * 1e-9
+        ):
             deduped.append(value)
     return deduped
+
+
+def contour_uncertainty_fraction(
+    contour: ContourEstimate, domain: Domain, config: ModelConfig
+) -> float:
+    lower = max(min(contour.y_c_q05, contour.y_c_q95), domain.y_min)
+    upper = min(max(contour.y_c_q05, contour.y_c_q95), domain.y_max)
+    if lower <= 0 and config.y_scale == "log10":
+        return 0.0
+    spread = abs(
+        transformed_value(upper, config.y_scale, "y")
+        - transformed_value(lower, config.y_scale, "y")
+    )
+    span = transformed_span(domain.y_min, domain.y_max, config.y_scale, "y")
+    return clamp(spread / max(span, 1e-12), 0.0, 1.0)
+
+
+def y_offsets_near_contour(
+    contour: ContourEstimate, domain: Domain, config: ModelConfig
+) -> list[float]:
+    center_t = transformed_value(contour.y_c_pred, config.y_scale, "y")
+    lower_t = transformed_value(domain.y_min, config.y_scale, "y")
+    upper_t = transformed_value(domain.y_max, config.y_scale, "y")
+    span_t = max(upper_t - lower_t, 1e-12)
+    q05_t = transformed_value(
+        clamp(contour.y_c_q05, domain.y_min, domain.y_max), config.y_scale, "y"
+    )
+    q95_t = transformed_value(
+        clamp(contour.y_c_q95, domain.y_min, domain.y_max), config.y_scale, "y"
+    )
+    half_spread_t = max(abs(q95_t - q05_t) / 4.0, 0.025 * span_t)
+    return [
+        inverse_transformed_value(clamp(center_t + offset, lower_t, upper_t), config.y_scale)
+        for offset in (0.0, -half_spread_t, half_spread_t)
+    ]
 
 
 def propose_new_points(
@@ -590,30 +766,23 @@ def propose_new_points(
         return []
     aggregates_by_coord = {(point.x, point.y): point for point in aggregates}
     proposals: list[Proposal] = []
-    x_values = candidate_x_values(domain, aggregates, max(config.grid_size, count * 4))
+    x_values = candidate_x_values(domain, aggregates, config, max(config.grid_size, count * 4))
 
     for x in x_values:
         contour = contour_estimate(x, aggregates, domain, config, rng)
-        offsets = [0.0]
-        if contour.y_c_std > 0:
-            offsets.extend([-0.5 * contour.y_c_std, 0.5 * contour.y_c_std])
-        else:
-            offsets.extend([-0.03 * domain.y_span, 0.03 * domain.y_span])
-
-        for offset in offsets:
-            y = clamp(contour.y_c_pred + offset, domain.y_min, domain.y_max)
+        for y in y_offsets_near_contour(contour, domain, config):
             n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
             if n_existing:
                 continue
             p_pred, p_std = predict_probability(x, y, contour, aggregates, config)
             near_contour = 1.0 - min(1.0, abs(p_pred - 0.5) * 2.0)
             novelty = clamp(
-                normalized_distance_to_existing(x, y, aggregates, domain) / 0.20,
+                normalized_distance_to_existing(x, y, aggregates, domain, config) / 0.20,
                 0.0,
                 1.0,
             )
-            gap = x_gap_score(x, aggregates, domain)
-            contour_uncertainty = clamp(contour.y_c_std / max(domain.y_span, 1e-12), 0.0, 1.0)
+            gap = x_gap_score(x, aggregates, domain, config)
+            contour_uncertainty = contour_uncertainty_fraction(contour, domain, config)
             score = (
                 0.35 * near_contour
                 + 0.25 * contour_uncertainty
@@ -649,8 +818,16 @@ def propose_new_points(
             break
         if all(
             math.hypot(
-                (proposal.x - chosen.x) / max(domain.x_span, 1e-12),
-                (proposal.y - chosen.y) / max(domain.y_span, 1e-12),
+                (
+                    transformed_value(proposal.x, config.x_scale, "x")
+                    - transformed_value(chosen.x, config.x_scale, "x")
+                )
+                / max(transformed_span(domain.x_min, domain.x_max, config.x_scale, "x"), 1e-12),
+                (
+                    transformed_value(proposal.y, config.y_scale, "y")
+                    - transformed_value(chosen.y, config.y_scale, "y")
+                )
+                / max(transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"), 1e-12),
             )
             >= 0.03
             for chosen in selected
@@ -798,6 +975,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="decreasing",
         help="Direction for p(id=1) as y increases when --mode monotone-y is used.",
     )
+    parser.add_argument("--x-scale", choices=["linear", "log10"], default="linear")
     parser.add_argument("--y-scale", choices=["linear", "log10"], default="linear")
     parser.add_argument("--transition-width", type=float, default=0.10)
     parser.add_argument("--label-noise", type=float, default=0.02)
@@ -824,6 +1002,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--posterior-samples cannot be negative")
 
 
+def validate_domain_scales(domain: Domain, args: argparse.Namespace) -> None:
+    transformed_span(domain.x_min, domain.x_max, args.x_scale, "x")
+    transformed_span(domain.y_min, domain.y_max, args.y_scale, "y")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -843,14 +1026,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             y_min=args.y_min,
             y_max=args.y_max,
         )
+        validate_domain_scales(domain, args)
         config = ModelConfig(
             mode=args.mode,
             monotone_direction=args.monotone_direction,
+            x_scale=args.x_scale,
             y_scale=args.y_scale,
             transition_width=args.transition_width,
             label_noise=args.label_noise,
-            length_scale_x=args.length_scale_x or default_length_scale(domain.x_span),
-            length_scale_y=args.length_scale_y or default_length_scale(domain.y_span),
+            length_scale_x=args.length_scale_x
+            or default_length_scale(
+                transformed_span(domain.x_min, domain.x_max, args.x_scale, "x")
+            ),
+            length_scale_y=args.length_scale_y
+            or default_length_scale(
+                transformed_span(domain.y_min, domain.y_max, args.y_scale, "y")
+            ),
             prior_alpha=args.prior_alpha,
             prior_beta=args.prior_beta,
             grid_size=args.grid_size,

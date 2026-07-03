@@ -37,6 +37,9 @@ For physical projects, pass column mappings:
 --x-col Rr --y-col Oh --label-col id
 ```
 
+Use `--x-scale log10` and/or `--y-scale log10` when distance, gaps, and contour
+resolution should be measured in log space.
+
 Rows with `id = -1` are treated as stale or pending proposals and are ignored
 during fitting.
 

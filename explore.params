@@ -1,0 +1,26 @@
+# Drop-injection active-learning defaults.
+# Values here are used by end-to-end-with-visualization-drop-injection.py.
+# Command-line flags override these values.
+
+seed = 11
+iterations = 60
+initial_points = 20
+batch_size = 8
+
+# Parameter-space bounds from the drop-injection regime map.
+rr_min = 1
+rr_max = 100
+rr_scale = log10
+oh_min = 0.001
+oh_max = 0.1
+oh_scale = log10
+
+# Proposal model and display-performance controls.
+# posterior_samples = 0 is the fast interactive visualizer setting.
+# Increase it when uncertainty bands matter more than run speed.
+grid_size = 15
+posterior_samples = 0
+preview_points = 48
+preview_every = 5
+preview_posterior_samples = 0
+delay = 0.04

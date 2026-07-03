@@ -218,6 +218,31 @@ class ProposeNextSweepTests(unittest.TestCase):
 
         self.assertGreater(low_y, high_y)
 
+    def test_log_x_scale_uses_geometric_candidate_spacing(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        aggregates = [
+            sweep.AggregatePoint(x=1.0, y=0.01, n=1, k=1),
+            sweep.AggregatePoint(x=100.0, y=0.04, n=1, k=0),
+        ]
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.10,
+            label_noise=0.02,
+            length_scale_x=0.4,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=5,
+            posterior_samples=0,
+        )
+
+        candidates = sweep.candidate_x_values(domain, aggregates, config, 3)
+
+        self.assertTrue(any(abs(value - 10.0) < 1e-9 for value in candidates))
+
 
 if __name__ == "__main__":
     unittest.main()

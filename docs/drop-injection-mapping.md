@@ -28,9 +28,12 @@ python3 propose_next_sweep.py examples/drop_injection_seed.csv \
   --y-col Oh \
   --mode monotone-y \
   --monotone-direction decreasing \
+  --x-scale log10 \
   --y-scale log10 \
-  --y-min 0.01 \
-  --y-max 0.2 \
+  --x-min 1 \
+  --x-max 100 \
+  --y-min 0.001 \
+  --y-max 0.1 \
   --outfile Sweep-1.csv \
   --n-simulations 8 \
   --seed 11
@@ -59,6 +62,17 @@ python3 end-to-end-with-visualization-drop-injection.py
 
 By default this runs 60 active-learning sweeps. Use `--iterations N` or
 `--n-iterations N` for longer campaigns.
+
+The default bounds and scales are stored in [../explore.params](../explore.params):
+
+```text
+rr_min = 1
+rr_max = 100
+rr_scale = log10
+oh_min = 0.001
+oh_max = 0.1
+oh_scale = log10
+```
 
 This script keeps the drop-injection physical labels visible in the animation:
 

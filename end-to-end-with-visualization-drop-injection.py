@@ -25,14 +25,53 @@ from classify_drops import oh_c
 REPO_ROOT = Path(__file__).resolve().parent
 PROPOSE_SCRIPT = REPO_ROOT / "propose_next_sweep.py"
 CLASSIFIER_SCRIPT = REPO_ROOT / "classify_drops.py"
+DEFAULT_PARAMS_FILE = REPO_ROOT / "explore.params"
+DEFAULT_PARAMS: dict[str, Any] = {
+    "iterations": 60,
+    "initial_points": 20,
+    "batch_size": 8,
+    "seed": 11,
+    "rr_min": 1.0,
+    "rr_max": 100.0,
+    "rr_scale": "log10",
+    "oh_min": 0.001,
+    "oh_max": 0.1,
+    "oh_scale": "log10",
+    "grid_size": 15,
+    "posterior_samples": 0,
+    "preview_points": 48,
+    "preview_every": 5,
+    "preview_posterior_samples": 0,
+    "delay": 0.04,
+}
+PARAM_TYPES = {
+    "iterations": int,
+    "initial_points": int,
+    "batch_size": int,
+    "seed": int,
+    "rr_min": float,
+    "rr_max": float,
+    "rr_scale": str,
+    "oh_min": float,
+    "oh_max": float,
+    "oh_scale": str,
+    "grid_size": int,
+    "posterior_samples": int,
+    "preview_points": int,
+    "preview_every": int,
+    "preview_posterior_samples": int,
+    "delay": float,
+}
 
 
 @dataclass(frozen=True)
 class Domain:
     rr_min: float
     rr_max: float
+    rr_scale: str
     oh_min: float
     oh_max: float
+    oh_scale: str
 
 
 @dataclass(frozen=True)
@@ -68,31 +107,69 @@ class DirectoryHandler(SimpleHTTPRequestHandler):
         return
 
 
+def load_params_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    params: dict[str, Any] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError(f"{path}:{line_number} expected key = value")
+        key, value = [part.strip() for part in line.split("=", 1)]
+        key = key.replace("-", "_")
+        if key not in PARAM_TYPES:
+            raise ValueError(f"{path}:{line_number} unknown parameter {key!r}")
+        try:
+            params[key] = PARAM_TYPES[key](value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{path}:{line_number} could not parse {key!r} value {value!r}"
+            ) from exc
+    return params
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--params-file", type=Path, default=DEFAULT_PARAMS_FILE)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+    defaults = {**DEFAULT_PARAMS, **load_params_file(pre_args.params_file)}
+
     parser = argparse.ArgumentParser(
         description=(
             "Animate a drop-injection active-learning campaign by calling "
             "propose_next_sweep.py and classify_drops.py under the hood."
-        )
+        ),
+        parents=[pre_parser],
     )
     parser.add_argument(
         "--iterations",
         "--n-iterations",
         type=int,
-        default=60,
+        default=defaults["iterations"],
         help="Number of active-learning sweeps to run.",
     )
-    parser.add_argument("--initial-points", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=11)
-    parser.add_argument("--rr-min", type=float, default=2.0)
-    parser.add_argument("--rr-max", type=float, default=12.0)
-    parser.add_argument("--oh-min", type=float, default=0.01)
-    parser.add_argument("--oh-max", type=float, default=0.20)
-    parser.add_argument("--grid-size", type=int, default=41)
-    parser.add_argument("--posterior-samples", type=int, default=24)
-    parser.add_argument("--preview-points", type=int, default=80)
-    parser.add_argument("--delay", type=float, default=0.08)
+    parser.add_argument("--initial-points", type=int, default=defaults["initial_points"])
+    parser.add_argument("--batch-size", type=int, default=defaults["batch_size"])
+    parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument("--rr-min", type=float, default=defaults["rr_min"])
+    parser.add_argument("--rr-max", type=float, default=defaults["rr_max"])
+    parser.add_argument("--rr-scale", choices=["linear", "log10"], default=defaults["rr_scale"])
+    parser.add_argument("--oh-min", type=float, default=defaults["oh_min"])
+    parser.add_argument("--oh-max", type=float, default=defaults["oh_max"])
+    parser.add_argument("--oh-scale", choices=["linear", "log10"], default=defaults["oh_scale"])
+    parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
+    parser.add_argument("--posterior-samples", type=int, default=defaults["posterior_samples"])
+    parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
+    parser.add_argument("--preview-every", type=int, default=defaults["preview_every"])
+    parser.add_argument(
+        "--preview-posterior-samples",
+        type=int,
+        default=defaults["preview_posterior_samples"],
+    )
+    parser.add_argument("--delay", type=float, default=defaults["delay"])
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--no-browser", action="store_true")
@@ -112,12 +189,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rr-min must be less than --rr-max")
     if args.oh_min <= 0 or args.oh_min >= args.oh_max:
         raise ValueError("--oh-min must be positive and less than --oh-max")
+    if args.rr_scale == "log10" and args.rr_min <= 0:
+        raise ValueError("--rr-scale log10 requires --rr-min to be positive")
+    if args.oh_scale == "log10" and args.oh_min <= 0:
+        raise ValueError("--oh-scale log10 requires --oh-min to be positive")
     if args.grid_size < 5:
         raise ValueError("--grid-size must be at least 5")
     if args.posterior_samples < 0:
         raise ValueError("--posterior-samples cannot be negative")
     if args.preview_points < 2:
         raise ValueError("--preview-points must be at least 2")
+    if args.preview_every < 1:
+        raise ValueError("--preview-every must be at least 1")
+    if args.preview_posterior_samples < 0:
+        raise ValueError("--preview-posterior-samples cannot be negative")
     if args.delay < 0:
         raise ValueError("--delay cannot be negative")
 
@@ -144,6 +229,20 @@ def format_float(value: float) -> str:
     return f"{value:.10g}"
 
 
+def scaled_value(value: float, scale: str) -> float:
+    return math.log10(value) if scale == "log10" else value
+
+
+def inverse_scaled_value(value: float, scale: str) -> float:
+    return 10**value if scale == "log10" else value
+
+
+def value_at_fraction(lower: float, upper: float, fraction: float, scale: str) -> float:
+    lower_t = scaled_value(lower, scale)
+    upper_t = scaled_value(upper, scale)
+    return inverse_scaled_value(lower_t + fraction * (upper_t - lower_t), scale)
+
+
 def classify_drop(rr: float, oh: float) -> int:
     result = subprocess.run(
         [sys.executable, str(CLASSIFIER_SCRIPT), format_float(oh), format_float(rr)],
@@ -164,14 +263,12 @@ def make_initial_design(count: int, domain: Domain, seed: int) -> list[Completed
     rng.shuffle(rr_slots)
     rng.shuffle(oh_slots)
 
-    log_oh_min = math.log10(domain.oh_min)
-    log_oh_max = math.log10(domain.oh_max)
     runs: list[CompletedRun] = []
     for index in range(count):
         rr_fraction = (rr_slots[index] + 0.5) / count
         oh_fraction = (oh_slots[index] + 0.5) / count
-        rr = domain.rr_min + rr_fraction * (domain.rr_max - domain.rr_min)
-        oh = 10 ** (log_oh_min + oh_fraction * (log_oh_max - log_oh_min))
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, rr_fraction, domain.rr_scale)
+        oh = value_at_fraction(domain.oh_min, domain.oh_max, oh_fraction, domain.oh_scale)
         label = classify_drop(rr, oh)
         runs.append(
             CompletedRun(
@@ -231,8 +328,10 @@ def run_proposal(
         "monotone-y",
         "--monotone-direction",
         "decreasing",
+        "--x-scale",
+        domain.rr_scale,
         "--y-scale",
-        "log10",
+        domain.oh_scale,
         "--x-min",
         format_float(domain.rr_min),
         "--x-max",
@@ -293,7 +392,7 @@ def find_true_contour(domain: Domain, samples: int = 80) -> list[dict[str, float
     contour: list[dict[str, float]] = []
     for index in range(samples):
         fraction = index / (samples - 1) if samples > 1 else 0.5
-        rr = domain.rr_min + fraction * (domain.rr_max - domain.rr_min)
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, fraction, domain.rr_scale)
         oh = oh_c(rr)
         if domain.oh_min <= oh <= domain.oh_max:
             contour.append({"Rr": rr, "Oh": oh})
@@ -373,8 +472,10 @@ def update_visual_state(
         "domain": {
             "rr_min": domain.rr_min,
             "rr_max": domain.rr_max,
+            "rr_scale": domain.rr_scale,
             "oh_min": domain.oh_min,
             "oh_max": domain.oh_max,
+            "oh_scale": domain.oh_scale,
         },
         "completed": completed_payload(completed),
         "proposals": proposals_payload(proposals),
@@ -701,6 +802,8 @@ let latest = null;
 const pad = { left: 78, right: 36, top: 36, bottom: 66 };
 
 function log10(v) { return Math.log(v) / Math.LN10; }
+function transform(v, scale) { return scale === "log10" ? log10(v) : v; }
+function inverseTransform(v, scale) { return scale === "log10" ? Math.pow(10, v) : v; }
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
 function resizeCanvas() {
@@ -725,17 +828,47 @@ function plotArea() {
 function scales(state) {
   const area = plotArea();
   const d = state.domain;
-  const lo = log10(d.oh_min);
-  const hi = log10(d.oh_max);
+  const rrLo = transform(d.rr_min, d.rr_scale || "linear");
+  const rrHi = transform(d.rr_max, d.rr_scale || "linear");
+  const ohLo = transform(d.oh_min, d.oh_scale || "log10");
+  const ohHi = transform(d.oh_max, d.oh_scale || "log10");
   return {
     x(rr) {
-      return area.x0 + (rr - d.rr_min) / (d.rr_max - d.rr_min) * (area.x1 - area.x0);
+      return area.x0 + (transform(rr, d.rr_scale || "linear") - rrLo) / (rrHi - rrLo) * (area.x1 - area.x0);
     },
     y(oh) {
-      return area.y1 - (log10(oh) - lo) / (hi - lo) * (area.y1 - area.y0);
+      return area.y1 - (transform(oh, d.oh_scale || "log10") - ohLo) / (ohHi - ohLo) * (area.y1 - area.y0);
     },
     area,
   };
+}
+
+function axisTicks(minValue, maxValue, scale, targetCount = 6) {
+  if (scale === "log10") {
+    const ticks = [];
+    const startPower = Math.floor(log10(minValue));
+    const endPower = Math.ceil(log10(maxValue));
+    for (let power = startPower; power <= endPower; power++) {
+      for (const mantissa of [1, 2, 5]) {
+        const value = mantissa * Math.pow(10, power);
+        if (value >= minValue * 0.999999 && value <= maxValue * 1.000001) ticks.push(value);
+      }
+    }
+    if (!ticks.includes(maxValue)) ticks.push(maxValue);
+    return [...new Set(ticks)].sort((a, b) => a - b);
+  }
+  const ticks = [];
+  for (let i = 0; i <= targetCount; i++) {
+    ticks.push(minValue + (maxValue - minValue) * i / targetCount);
+  }
+  return ticks;
+}
+
+function formatTick(value) {
+  if (value >= 100) return value.toFixed(0);
+  if (value >= 10) return value.toFixed(value % 1 ? 1 : 0);
+  if (value >= 1) return value.toFixed(value % 1 ? 1 : 0);
+  return value.toPrecision(2).replace(/0+$/, "").replace(/\\.$/, "");
 }
 
 function drawGrid(state, s) {
@@ -753,21 +886,20 @@ function drawGrid(state, s) {
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const d = state.domain;
-  for (let i = 0; i <= 5; i++) {
-    const rr = d.rr_min + (d.rr_max - d.rr_min) * i / 5;
+  const xTicks = axisTicks(d.rr_min, d.rr_max, d.rr_scale || "linear", 5);
+  for (const rr of xTicks) {
     const x = s.x(rr);
     ctx.beginPath();
     ctx.moveTo(x, area.y0);
     ctx.lineTo(x, area.y1);
-    ctx.strokeStyle = i === 0 || i === 5 ? "#d8e0df" : "#edf1f4";
+    ctx.strokeStyle = rr === d.rr_min || rr === d.rr_max ? "#d8e0df" : "#edf1f4";
     ctx.stroke();
-    ctx.fillText(rr.toFixed(1), x, area.y1 + 12);
+    ctx.fillText(formatTick(rr), x, area.y1 + 12);
   }
 
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  const yTicks = [0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.12, 0.16, 0.2]
-    .filter(v => v >= d.oh_min && v <= d.oh_max);
+  const yTicks = axisTicks(d.oh_min, d.oh_max, d.oh_scale || "log10", 6);
   for (const oh of yTicks) {
     const y = s.y(oh);
     ctx.beginPath();
@@ -775,7 +907,7 @@ function drawGrid(state, s) {
     ctx.lineTo(area.x1, y);
     ctx.strokeStyle = "#edf1f4";
     ctx.stroke();
-    ctx.fillText(oh.toFixed(3).replace(/0+$/, "").replace(/\\.$/, ""), area.x0 - 10, y);
+    ctx.fillText(formatTick(oh), area.x0 - 10, y);
   }
 
   ctx.textAlign = "center";
@@ -786,7 +918,7 @@ function drawGrid(state, s) {
   ctx.save();
   ctx.translate(20, (area.y0 + area.y1) / 2);
   ctx.rotate(-Math.PI / 2);
-  ctx.fillText("Oh (log scale)", 0, 0);
+  ctx.fillText(`Oh (${d.oh_scale || "linear"} scale)`, 0, 0);
   ctx.restore();
 }
 
@@ -1016,8 +1148,10 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     domain = Domain(
         rr_min=args.rr_min,
         rr_max=args.rr_max,
+        rr_scale=args.rr_scale,
         oh_min=args.oh_min,
         oh_max=args.oh_max,
+        oh_scale=args.oh_scale,
     )
     output_dir = args.output_dir or default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1072,6 +1206,7 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     )
     sleep_if_requested(args.delay)
 
+    preview_contour: list[dict[str, float]] = []
     for iteration in range(1, args.iterations + 1):
         proposed_path = output_dir / f"Sweep-{iteration}_proposed.csv"
         proposal_rows = run_proposal(
@@ -1085,25 +1220,33 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         )
         proposals = [proposal_from_row(row) for row in proposal_rows]
 
-        preview_path = output_dir / f"Sweep-{iteration}_contour-preview.csv"
-        preview_rows = run_proposal(
-            completed_files,
-            preview_path,
-            domain,
-            n_simulations=args.preview_points,
-            seed=args.seed + 10_000 + iteration,
-            grid_size=args.grid_size,
-            posterior_samples=max(args.posterior_samples // 2, 1),
-            n_new=args.preview_points,
-            n_repeats=0,
+        should_refresh_preview = (
+            iteration == 1
+            or iteration == args.iterations
+            or iteration % args.preview_every == 0
         )
-        preview_contour = build_preview_contour(preview_rows)
+        if should_refresh_preview:
+            preview_path = output_dir / f"Sweep-{iteration}_contour-preview.csv"
+            preview_rows = run_proposal(
+                completed_files,
+                preview_path,
+                domain,
+                n_simulations=args.preview_points,
+                seed=args.seed + 10_000 + iteration,
+                grid_size=args.grid_size,
+                posterior_samples=args.preview_posterior_samples,
+                n_new=args.preview_points,
+                n_repeats=0,
+            )
+            preview_contour = build_preview_contour(preview_rows)
 
         new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
         repeat_proposals = len(proposals) - new_proposals
         messages.append(
             f"Sweep {iteration}: proposed {new_proposals} new and {repeat_proposals} repeat runs."
         )
+        if should_refresh_preview:
+            messages.append(f"Sweep {iteration}: refreshed the learned contour preview.")
         update_visual_state(
             output_dir,
             status=f"sweep {iteration} proposed",

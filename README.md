@@ -26,9 +26,12 @@ python3 propose_next_sweep.py examples/drop_injection_seed.csv \
   --x-col Rr \
   --y-col Oh \
   --mode monotone-y \
+  --x-scale log10 \
   --y-scale log10 \
-  --y-min 0.01 \
-  --y-max 0.2 \
+  --x-min 1 \
+  --x-max 100 \
+  --y-min 0.001 \
+  --y-max 0.1 \
   --outfile Sweep-1.csv \
   --n-simulations 8 \
   --seed 11
@@ -48,7 +51,16 @@ This creates a local `visualization_runs/` directory, opens an animated canvas
 view, calls `propose_next_sweep.py` for each batch, and calls
 `classify_drops.py` as the experiment runner.
 
-The visualizer defaults to 60 active-learning sweeps. Set the run length with:
+The visualizer reads defaults from [explore.params](explore.params), including
+the initial random seed, bounds, batch size, and log/linear axis choices. The
+drop-injection defaults use a log-log parameter space:
+
+```text
+Rr: 1 to 100
+Oh: 0.001 to 0.1
+```
+
+Set the run length with:
 
 ```bash
 python3 end-to-end-with-visualization-drop-injection.py --iterations 120

@@ -40,6 +40,10 @@ The visualizer starts from an initial space-filling design, calls
 simulate the experiment labels, and updates a browser animation as the campaign
 advances.
 
+The visualizer does not need an external initial CSV. If no completed data file
+exists, it generates an initial space-filling design using `seed` and
+`initial_points` from [../explore.params](../explore.params).
+
 Useful options:
 
 ```bash
@@ -53,6 +57,14 @@ python3 end-to-end-with-visualization-drop-injection.py \
 `--n-iterations` is accepted as an alias for `--iterations`. Increase
 `--delay` for a slower presentation run, or set `--delay 0` for a fast
 batch-style run that still writes the final visualization artifacts.
+
+For long runs, contour previews are refreshed every `preview_every` sweeps by
+default. This avoids the slowdown caused by recomputing a dense display-only
+contour on every iteration as the campaign grows.
+
+The visualizer defaults to `posterior_samples = 0` in `explore.params` for fast
+interactive animation. Increase `posterior_samples` and
+`preview_posterior_samples` when uncertainty bands matter more than speed.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.
