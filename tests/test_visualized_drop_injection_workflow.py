@@ -31,6 +31,8 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
                     "3",
                     "--preview-points",
                     "4",
+                    "--preview-grid-size",
+                    "5",
                     "--grid-size",
                     "5",
                     "--posterior-samples",

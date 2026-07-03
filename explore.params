@@ -6,6 +6,8 @@ seed = 11
 iterations = 60
 initial_points = 20
 batch_size = 8
+n_new = auto
+n_repeats = auto
 
 # Parameter-space bounds from the drop-injection regime map.
 rr_min = 1
@@ -20,7 +22,8 @@ oh_scale = log10
 # Increase it when uncertainty bands matter more than run speed.
 grid_size = 15
 posterior_samples = 0
-preview_points = 48
-preview_every = 5
+preview_points = 120
+preview_grid_size = 61
+preview_every = 10
 preview_posterior_samples = 0
 delay = 0.04

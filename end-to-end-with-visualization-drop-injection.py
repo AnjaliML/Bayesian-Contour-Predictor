@@ -20,16 +20,28 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from classify_drops import oh_c
+import propose_next_sweep as sweep
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 PROPOSE_SCRIPT = REPO_ROOT / "propose_next_sweep.py"
 CLASSIFIER_SCRIPT = REPO_ROOT / "classify_drops.py"
 DEFAULT_PARAMS_FILE = REPO_ROOT / "explore.params"
+
+
+def optional_int(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"auto", "default", "none", ""}:
+        return None
+    return int(value)
+
+
 DEFAULT_PARAMS: dict[str, Any] = {
     "iterations": 60,
     "initial_points": 20,
     "batch_size": 8,
+    "n_new": None,
+    "n_repeats": None,
     "seed": 11,
     "rr_min": 1.0,
     "rr_max": 100.0,
@@ -39,8 +51,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "oh_scale": "log10",
     "grid_size": 15,
     "posterior_samples": 0,
-    "preview_points": 48,
-    "preview_every": 5,
+    "preview_points": 120,
+    "preview_grid_size": 61,
+    "preview_every": 10,
     "preview_posterior_samples": 0,
     "delay": 0.04,
 }
@@ -48,6 +61,8 @@ PARAM_TYPES = {
     "iterations": int,
     "initial_points": int,
     "batch_size": int,
+    "n_new": optional_int,
+    "n_repeats": optional_int,
     "seed": int,
     "rr_min": float,
     "rr_max": float,
@@ -58,6 +73,7 @@ PARAM_TYPES = {
     "grid_size": int,
     "posterior_samples": int,
     "preview_points": int,
+    "preview_grid_size": int,
     "preview_every": int,
     "preview_posterior_samples": int,
     "delay": float,
@@ -153,6 +169,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--initial-points", type=int, default=defaults["initial_points"])
     parser.add_argument("--batch-size", type=int, default=defaults["batch_size"])
+    parser.add_argument(
+        "--n-new",
+        type=optional_int,
+        default=defaults["n_new"],
+        help="New coordinates per sweep. Use 'auto' to let propose_next_sweep.py choose.",
+    )
+    parser.add_argument(
+        "--n-repeats",
+        type=optional_int,
+        default=defaults["n_repeats"],
+        help="Repeat coordinates per sweep. Use 'auto' to let propose_next_sweep.py choose.",
+    )
     parser.add_argument("--seed", type=int, default=defaults["seed"])
     parser.add_argument("--rr-min", type=float, default=defaults["rr_min"])
     parser.add_argument("--rr-max", type=float, default=defaults["rr_max"])
@@ -163,6 +191,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
     parser.add_argument("--posterior-samples", type=int, default=defaults["posterior_samples"])
     parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
+    parser.add_argument("--preview-grid-size", type=int, default=defaults["preview_grid_size"])
     parser.add_argument("--preview-every", type=int, default=defaults["preview_every"])
     parser.add_argument(
         "--preview-posterior-samples",
@@ -185,6 +214,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--initial-points must be at least 2")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.n_new is not None and args.n_new < 0:
+        raise ValueError("--n-new cannot be negative")
+    if args.n_repeats is not None and args.n_repeats < 0:
+        raise ValueError("--n-repeats cannot be negative")
+    if args.n_new is not None and args.n_new > args.batch_size:
+        raise ValueError("--n-new cannot exceed --batch-size")
+    if args.n_repeats is not None and args.n_repeats > args.batch_size:
+        raise ValueError("--n-repeats cannot exceed --batch-size")
+    if (
+        args.n_new is not None
+        and args.n_repeats is not None
+        and args.n_new + args.n_repeats != args.batch_size
+    ):
+        raise ValueError("--n-new plus --n-repeats must equal --batch-size")
     if args.rr_min >= args.rr_max:
         raise ValueError("--rr-min must be less than --rr-max")
     if args.oh_min <= 0 or args.oh_min >= args.oh_max:
@@ -199,6 +242,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--posterior-samples cannot be negative")
     if args.preview_points < 2:
         raise ValueError("--preview-points must be at least 2")
+    if args.preview_grid_size < 5:
+        raise ValueError("--preview-grid-size must be at least 5")
     if args.preview_every < 1:
         raise ValueError("--preview-every must be at least 1")
     if args.preview_posterior_samples < 0:
@@ -399,17 +444,93 @@ def find_true_contour(domain: Domain, samples: int = 80) -> list[dict[str, float
     return contour
 
 
-def build_preview_contour(rows: Sequence[dict[str, str]]) -> list[dict[str, float]]:
-    seen: dict[float, dict[str, float]] = {}
-    for row in rows:
-        rr = float(row["x"])
-        seen[rr] = {
-            "Rr": rr,
-            "y_c_pred": float(row.get("y_c_pred", row["y"]) or row["y"]),
-            "y_c_q05": float(row.get("y_c_q05", row["y"]) or row["y"]),
-            "y_c_q95": float(row.get("y_c_q95", row["y"]) or row["y"]),
-        }
-    return [seen[rr] for rr in sorted(seen)]
+def model_preview_config(domain: Domain, grid_size: int, posterior_samples: int) -> sweep.ModelConfig:
+    model_domain = sweep.Domain(
+        x_min=domain.rr_min,
+        x_max=domain.rr_max,
+        y_min=domain.oh_min,
+        y_max=domain.oh_max,
+    )
+    return sweep.ModelConfig(
+        mode="monotone-y",
+        monotone_direction="decreasing",
+        x_scale=domain.rr_scale,
+        y_scale=domain.oh_scale,
+        transition_width=0.10,
+        label_noise=0.02,
+        length_scale_x=sweep.default_length_scale(
+            sweep.transformed_span(
+                model_domain.x_min, model_domain.x_max, domain.rr_scale, "x"
+            )
+        ),
+        length_scale_y=sweep.default_length_scale(
+            sweep.transformed_span(
+                model_domain.y_min, model_domain.y_max, domain.oh_scale, "y"
+            )
+        ),
+        prior_alpha=1.0,
+        prior_beta=1.0,
+        grid_size=grid_size,
+        posterior_samples=posterior_samples,
+    )
+
+
+def build_model_preview_contour(
+    input_files: Sequence[Path],
+    domain: Domain,
+    *,
+    points: int,
+    grid_size: int,
+    posterior_samples: int,
+    seed: int,
+) -> list[dict[str, float]]:
+    observations, _ = sweep.read_csv_files(
+        input_files,
+        case_col="caseId",
+        x_col="Rr",
+        y_col="Oh",
+        label_col="id",
+    )
+    model_domain = sweep.Domain(
+        x_min=domain.rr_min,
+        x_max=domain.rr_max,
+        y_min=domain.oh_min,
+        y_max=domain.oh_max,
+    )
+    config = model_preview_config(domain, grid_size, posterior_samples)
+    aggregates = sweep.aggregate_observations(observations)
+    rng = random.Random(seed)
+
+    contour: list[dict[str, float]] = []
+    for index in range(points):
+        fraction = index / (points - 1) if points > 1 else 0.5
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, fraction, domain.rr_scale)
+        estimate = sweep.contour_estimate(rr, aggregates, model_domain, config, rng)
+        contour.append(
+            {
+                "Rr": rr,
+                "y_c_pred": estimate.y_c_pred,
+                "y_c_q05": estimate.y_c_q05,
+                "y_c_q95": estimate.y_c_q95,
+            }
+        )
+    return contour
+
+
+def write_preview_contour(path: Path, contour: Sequence[dict[str, float]]) -> None:
+    write_csv(
+        path,
+        ["Rr", "y_c_pred", "y_c_q05", "y_c_q95"],
+        [
+            {
+                "Rr": format_float(row["Rr"]),
+                "y_c_pred": format_float(row["y_c_pred"]),
+                "y_c_q05": format_float(row["y_c_q05"]),
+                "y_c_q95": format_float(row["y_c_q95"]),
+            }
+            for row in contour
+        ],
+    )
 
 
 def write_state(output_dir: Path, state: dict[str, Any]) -> None:
@@ -1217,6 +1338,8 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             seed=args.seed + iteration,
             grid_size=args.grid_size,
             posterior_samples=args.posterior_samples,
+            n_new=args.n_new,
+            n_repeats=args.n_repeats,
         )
         proposals = [proposal_from_row(row) for row in proposal_rows]
 
@@ -1227,18 +1350,15 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         )
         if should_refresh_preview:
             preview_path = output_dir / f"Sweep-{iteration}_contour-preview.csv"
-            preview_rows = run_proposal(
+            preview_contour = build_model_preview_contour(
                 completed_files,
-                preview_path,
                 domain,
-                n_simulations=args.preview_points,
-                seed=args.seed + 10_000 + iteration,
-                grid_size=args.grid_size,
+                points=args.preview_points,
+                grid_size=args.preview_grid_size,
                 posterior_samples=args.preview_posterior_samples,
-                n_new=args.preview_points,
-                n_repeats=0,
+                seed=args.seed + 10_000 + iteration,
             )
-            preview_contour = build_preview_contour(preview_rows)
+            write_preview_contour(preview_path, preview_contour)
 
         new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
         repeat_proposals = len(proposals) - new_proposals
