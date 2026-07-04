@@ -3,11 +3,11 @@
 # Command-line flags override these values.
 
 seed = 11
-iterations = 120
+iterations = 50
 initial_points = 20
-batch_size = 16
+batch_size = 32
 n_new = auto
-n_repeats = 3
+n_repeats = 4
 
 # Parameter-space bounds from the drop-injection regime map.
 rr_min = 1
@@ -20,16 +20,16 @@ oh_scale = log10
 # Proposal model and display-performance controls.
 # posterior_samples = 0 is the fast interactive visualizer setting.
 # Increase it when uncertainty bands matter more than run speed.
-grid_size = 15
-posterior_samples = 0
+grid_size = 31
+posterior_samples = 8
 transition_width = 0.04
 label_noise = 0.005
 contour_fit = adaptive-linear
 length_scale_x = 0.18
 length_scale_y = auto
-preview_points = 120
-preview_grid_size = 61
-preview_every = 10
+preview_points = 160
+preview_grid_size = 81
+preview_every = 5
 preview_posterior_samples = 0
 convergence_sse_tolerance = 0
 convergence_rms_tolerance = 0.0015
