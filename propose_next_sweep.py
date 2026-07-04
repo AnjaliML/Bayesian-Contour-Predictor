@@ -393,14 +393,18 @@ def monotone_negative_log_likelihood(
 
 
 def weighted_points_for_x(
-    x: float, aggregates: Sequence[AggregatePoint], config: ModelConfig
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
 ) -> list[tuple[AggregatePoint, float]]:
     x_t = transformed_x(x, config)
+    length_scale_x = boundary_adjusted_length_scale_x(x, domain, config)
     weighted: list[tuple[AggregatePoint, float]] = []
     for point in aggregates:
         weight = normal_weight(
             x_t - transformed_x(point.x, config),
-            config.length_scale_x,
+            length_scale_x,
         )
         if weight >= 1e-9:
             weighted.append((point, weight))
@@ -445,7 +449,7 @@ def estimate_monotone_y_c(
     lower = transformed_y(domain.y_min, config.y_scale)
     upper = transformed_y(domain.y_max, config.y_scale)
     candidates_t = linspace(lower, upper, max(config.grid_size, 5))
-    weighted_points = weighted_points_for_x(x, aggregates, config)
+    weighted_points = weighted_points_for_x(x, aggregates, domain, config)
     losses = [
         monotone_negative_log_likelihood_weighted(
             inverse_transformed_y(value, config.y_scale),
@@ -624,6 +628,14 @@ def boundary_focus(x: float, domain: Domain, config: ModelConfig) -> float:
     x_t = transformed_x(x, config)
     edge_distance = min(abs(x_t - lower), abs(upper - x_t))
     return clamp(1.0 - edge_distance / (0.16 * span), 0.0, 1.0)
+
+
+def boundary_adjusted_length_scale_x(
+    x: float, domain: Domain, config: ModelConfig
+) -> float:
+    focus = boundary_focus(x, domain, config)
+    adjusted = config.length_scale_x / (1.0 + 5.0 * focus)
+    return max(adjusted, config.length_scale_x * 0.12, 1e-12)
 
 
 def x_gap_score(

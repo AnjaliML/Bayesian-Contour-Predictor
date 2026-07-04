@@ -1,4 +1,6 @@
 import csv
+import math
+import random
 import subprocess
 import sys
 import tempfile
@@ -303,6 +305,72 @@ class ProposeNextSweepTests(unittest.TestCase):
         candidates = sweep.x_candidates_for_y_level(0.004, contour_path, domain, config)
 
         self.assertEqual(candidates, [1.0])
+
+    def test_boundary_contour_is_not_pulled_inward_by_one_sided_kernel(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+
+        def threshold(x):
+            return 0.0045 + 0.02 * (1.0 - math.exp(-0.35 * (x - 1.0)))
+
+        observations = []
+        case_id = 1
+        for index in range(50):
+            fraction = index / 49
+            y = 10 ** (
+                math.log10(0.0015)
+                + (math.log10(0.012) - math.log10(0.0015)) * fraction
+            )
+            observations.append(
+                sweep.Observation(
+                    str(case_id),
+                    1.0,
+                    y,
+                    1 if y < threshold(1.0) else 0,
+                )
+            )
+            case_id += 1
+        for index in range(30):
+            fraction = index / 29
+            x = 10 ** (
+                math.log10(1.05)
+                + (math.log10(15.0) - math.log10(1.05)) * fraction
+            )
+            y_c = threshold(x)
+            for multiplier in [0.8, 0.95, 1.05, 1.25]:
+                y = y_c * multiplier
+                observations.append(
+                    sweep.Observation(
+                        str(case_id),
+                        x,
+                        y,
+                        1 if y < threshold(x) else 0,
+                    )
+                )
+                case_id += 1
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.10,
+            label_noise=0.02,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=15,
+            posterior_samples=0,
+        )
+
+        estimate = sweep.contour_estimate(
+            1.0,
+            sweep.aggregate_observations(observations),
+            domain,
+            config,
+            rng=random.Random(1),
+        ).y_c_pred
+
+        self.assertLess(abs(math.log10(estimate) - math.log10(threshold(1.0))), 0.02)
 
     def test_log_x_scale_uses_geometric_candidate_spacing(self):
         domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
