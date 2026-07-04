@@ -31,6 +31,7 @@ CLASSIFIER_SCRIPTS = {
     "size-based": REPO_ROOT / "classify_drops_sized_based.py",
 }
 DEFAULT_PARAMS_FILE = REPO_ROOT / "explore.params"
+VISIBLE_MESSAGE_COUNT = 16
 
 
 def optional_int(value: str) -> int | None:
@@ -922,7 +923,7 @@ def update_visual_state(
         "contour": list(contour),
         "true_contour": list(true_contour),
         "history": list(history),
-        "messages": list(messages[-8:]),
+        "messages": list(messages[-VISIBLE_MESSAGE_COUNT:]),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     write_state(output_dir, state)
@@ -1668,6 +1669,12 @@ def sleep_if_requested(delay: float) -> None:
         time.sleep(delay)
 
 
+def log_progress(messages: list[str], message: str) -> None:
+    stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    messages.append(stamped)
+    print(stamped, flush=True)
+
+
 def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     domain = Domain(
         rr_min=args.rr_min,
@@ -1688,9 +1695,11 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         classifier=args.classifier,
         size_tolerance=args.size_tolerance,
     )
-    messages.append(
+    log_progress(messages, f"Writing visualization artifacts to {output_dir}.")
+    log_progress(
+        messages,
         "Built the reference classifier contour using "
-        f"{CLASSIFIER_SCRIPTS[args.classifier].name}."
+        f"{CLASSIFIER_SCRIPTS[args.classifier].name}.",
     )
     update_visual_state(
         output_dir,
@@ -1711,12 +1720,42 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     url: str | None = None
     if not args.no_server:
         server, url = start_server(output_dir, args.port)
-        messages.append(f"Serving live visualization at {url}.")
-        print(f"Live visualization: {url}")
-        print(f"Artifacts: {output_dir}")
+        log_progress(messages, f"Serving live visualization at {url}.")
+        update_visual_state(
+            output_dir,
+            status="serving visualization",
+            iteration=0,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=[],
+            proposals=[],
+            contour=[],
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
         if not args.no_browser:
             webbrowser.open(url)
 
+    log_progress(
+        messages,
+        f"Generating and classifying {args.initial_points} initial space-filling runs.",
+    )
+    update_visual_state(
+        output_dir,
+        status="building initial design",
+        iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
+        domain=domain,
+        completed=[],
+        proposals=[],
+        contour=[],
+        true_contour=true_contour,
+        history=history,
+        messages=messages,
+    )
     all_completed = make_initial_design(
         args.initial_points,
         domain,
@@ -1726,7 +1765,7 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
     )
     completed_files: list[Path] = [output_dir / "Sweep-0_completed.csv"]
     write_completed_sweep(completed_files[0], all_completed)
-    messages.append(f"Generated and classified {len(all_completed)} initial space-filling runs.")
+    log_progress(messages, f"Generated and classified {len(all_completed)} initial runs.")
     update_visual_state(
         output_dir,
         status="initial design complete",
@@ -1756,6 +1795,27 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         )
         if should_refresh_preview:
             preview_path = output_dir / f"Sweep-{iteration}_contour-preview.csv"
+            log_progress(
+                messages,
+                "Sweep "
+                f"{iteration}: refreshing learned contour preview "
+                f"({args.preview_points} points, grid {args.preview_grid_size}).",
+            )
+            update_visual_state(
+                output_dir,
+                status=f"sweep {iteration} refreshing preview",
+                iteration=iteration,
+                total_iterations=args.iterations,
+                batch_size=args.batch_size,
+                domain=domain,
+                completed=all_completed,
+                proposals=[],
+                contour=preview_contour,
+                true_contour=true_contour,
+                history=history,
+                messages=messages,
+            )
+            preview_started = time.perf_counter()
             preview_contour = build_model_preview_contour(
                 completed_files,
                 domain,
@@ -1770,6 +1830,12 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 seed=args.seed + 10_000 + iteration,
             )
             write_preview_contour(preview_path, preview_contour)
+            log_progress(
+                messages,
+                "Sweep "
+                f"{iteration}: refreshed learned contour preview in "
+                f"{time.perf_counter() - preview_started:.1f}s.",
+            )
             if (
                 args.convergence_rms_tolerance > 0
                 or args.convergence_max_tolerance > 0
@@ -1808,22 +1874,45 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 else:
                     stable_convergence_checks = 0
                 if metrics is not None:
-                    messages.append(
+                    log_progress(
+                        messages,
                         "Contour movement "
                         f"rms={metrics['rms']:.3g}, max={metrics['max']:.3g}, "
                         f"edge={metrics['boundary_max']:.3g} "
-                        f"({stable_convergence_checks}/{args.convergence_patience})."
+                        f"({stable_convergence_checks}/{args.convergence_patience}).",
                     )
                 if stable_convergence_checks >= args.convergence_patience:
                     stopped_for_convergence = True
-                    messages.append(
+                    log_progress(
+                        messages,
                         "Stopped early: learned contour movement stayed below "
-                        "the configured RMS, max, and boundary tolerances."
+                        "the configured RMS, max, and boundary tolerances.",
                     )
                     break
             previous_convergence_contour = list(preview_contour)
 
         proposed_path = output_dir / f"Sweep-{iteration}_proposed.csv"
+        log_progress(
+            messages,
+            "Sweep "
+            f"{iteration}: proposing {args.batch_size} runs "
+            f"(grid {args.grid_size}, posterior samples {args.posterior_samples}).",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} proposing next batch",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=[],
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        proposal_started = time.perf_counter()
         proposal_rows = run_proposal(
             completed_files,
             proposed_path,
@@ -1844,11 +1933,11 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
 
         new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
         repeat_proposals = len(proposals) - new_proposals
-        messages.append(
-            f"Sweep {iteration}: proposed {new_proposals} new and {repeat_proposals} repeat runs."
+        log_progress(
+            messages,
+            f"Sweep {iteration}: proposed {new_proposals} new and "
+            f"{repeat_proposals} repeat runs in {time.perf_counter() - proposal_started:.1f}s.",
         )
-        if should_refresh_preview:
-            messages.append(f"Sweep {iteration}: refreshed the learned contour preview.")
         update_visual_state(
             output_dir,
             status=f"sweep {iteration} proposed",
@@ -1866,7 +1955,27 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         sleep_if_requested(args.delay)
 
         newly_completed: list[CompletedRun] = []
-        for row in proposal_rows:
+        log_progress(
+            messages,
+            f"Sweep {iteration}: running {len(proposal_rows)} simulated experiments "
+            f"with {args.classifier} classifier.",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} running experiments",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=proposals,
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        progress_interval = max(1, min(16, len(proposal_rows) // 4 or 1))
+        for run_index, row in enumerate(proposal_rows, start=1):
             run = proposal_rows_to_completed(
                 [row],
                 iteration,
@@ -1875,6 +1984,17 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             )[0]
             newly_completed.append(run)
             all_completed.append(run)
+            if (
+                run_index == 1
+                or run_index == len(proposal_rows)
+                or run_index % progress_interval == 0
+            ):
+                log_progress(
+                    messages,
+                    f"Sweep {iteration}: ran {run_index}/{len(proposal_rows)} cases; "
+                    f"latest case {run.case_id} id={run.label}.",
+                )
+            remaining_case_ids = {done.case_id for done in newly_completed}
             update_visual_state(
                 output_dir,
                 status=f"sweep {iteration} running experiments",
@@ -1886,15 +2006,12 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 proposals=[
                     proposal
                     for proposal in proposals
-                    if proposal.case_id not in {done.case_id for done in newly_completed}
+                    if proposal.case_id not in remaining_case_ids
                 ],
                 contour=preview_contour,
                 true_contour=true_contour,
                 history=history,
-                messages=[
-                    *messages[-6:],
-                    f"Ran case {run.case_id}: Rr={run.rr:.3g}, Oh={run.oh:.3g}, id={run.label}.",
-                ],
+                messages=messages,
             )
             sleep_if_requested(args.delay / 2)
 
@@ -1919,8 +2036,9 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 "mean_score": mean_score,
             }
         )
-        messages.append(
-            f"Sweep {iteration}: observed {sweep_drops} drops and {sweep_no_drops} no-drops."
+        log_progress(
+            messages,
+            f"Sweep {iteration}: observed {sweep_drops} drops and {sweep_no_drops} no-drops.",
         )
         update_visual_state(
             output_dir,
@@ -1939,10 +2057,13 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         completed_iterations = iteration
         sleep_if_requested(args.delay)
 
-    messages.append(
-        "Campaign stopped after contour convergence."
-        if stopped_for_convergence
-        else "Campaign complete."
+    log_progress(
+        messages,
+        (
+            "Campaign stopped after contour convergence."
+            if stopped_for_convergence
+            else "Campaign complete."
+        ),
     )
     update_visual_state(
         output_dir,

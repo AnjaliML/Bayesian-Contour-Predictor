@@ -18,13 +18,25 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
         with Path(path).open(newline="") as handle:
             return list(csv.DictReader(handle))
 
+    def run_visualizer(self, args):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode:
+            self.fail(
+                "visualizer failed\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+        return result
+
     def test_visualizer_runs_one_complete_campaign_iteration(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "visualizer-run"
-            subprocess.run(
+            result = self.run_visualizer(
                 [
-                    sys.executable,
-                    str(SCRIPT),
                     "--iterations",
                     "1",
                     "--initial-points",
@@ -47,8 +59,7 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
                     "--no-browser",
                     "--output-dir",
                     str(output_dir),
-                ],
-                check=True,
+                ]
             )
 
             state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
@@ -78,14 +89,19 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
             self.assertEqual(state["history"][0]["completed"], 3)
             self.assertTrue(state["true_contour"])
             self.assertTrue(state["contour"])
+            self.assertLessEqual(len(state["messages"]), 16)
+            self.assertTrue(any("proposing 3 runs" in item for item in state["messages"]))
+            self.assertTrue(
+                any("running 3 simulated experiments" in item for item in state["messages"])
+            )
+            self.assertIn("Sweep 1: proposing 3 runs", result.stdout)
+            self.assertIn("Sweep 1: running 3 simulated experiments", result.stdout)
 
     def test_visualizer_can_stop_after_contour_convergence(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "visualizer-converged"
-            subprocess.run(
+            self.run_visualizer(
                 [
-                    sys.executable,
-                    str(SCRIPT),
                     "--iterations",
                     "5",
                     "--initial-points",
@@ -120,8 +136,7 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
                     "--no-browser",
                     "--output-dir",
                     str(output_dir),
-                ],
-                check=True,
+                ]
             )
 
             state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
@@ -133,10 +148,8 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
     def test_visualizer_can_use_size_based_classifier(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "visualizer-sized"
-            subprocess.run(
+            self.run_visualizer(
                 [
-                    sys.executable,
-                    str(SCRIPT),
                     "--classifier",
                     "size-based",
                     "--iterations",
@@ -161,8 +174,7 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
                     "--no-browser",
                     "--output-dir",
                     str(output_dir),
-                ],
-                check=True,
+                ]
             )
 
             state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
