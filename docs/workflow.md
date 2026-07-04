@@ -135,5 +135,4 @@ compares consecutive learned contours on the preview grid and stops when RMS
 movement, maximum pointwise movement, and edge-region movement stay below their
 configured tolerances for `convergence_patience` checks after
 `convergence_min_iterations` sweeps. `convergence_mode` can compare `y`,
-inverse `x`, or `both` views of the contour. `convergence_sse_tolerance` is
-kept as a legacy optional stop check and can stay `0`.
+inverse `x`, or `both` views of the contour.

@@ -67,7 +67,6 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "preview_grid_size": 61,
     "preview_every": 10,
     "preview_posterior_samples": 0,
-    "convergence_sse_tolerance": 0.0,
     "convergence_rms_tolerance": 0.0015,
     "convergence_max_tolerance": 0.008,
     "convergence_boundary_tolerance": 0.004,
@@ -101,7 +100,6 @@ PARAM_TYPES = {
     "preview_grid_size": int,
     "preview_every": int,
     "preview_posterior_samples": int,
-    "convergence_sse_tolerance": float,
     "convergence_rms_tolerance": float,
     "convergence_max_tolerance": float,
     "convergence_boundary_tolerance": float,
@@ -241,12 +239,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=defaults["preview_posterior_samples"],
     )
     parser.add_argument(
-        "--convergence-sse-tolerance",
-        type=float,
-        default=defaults["convergence_sse_tolerance"],
-        help="Legacy early stop on transformed contour SSE. Use 0 to disable.",
-    )
-    parser.add_argument(
         "--convergence-rms-tolerance",
         type=float,
         default=defaults["convergence_rms_tolerance"],
@@ -346,8 +338,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--preview-every must be at least 1")
     if args.preview_posterior_samples < 0:
         raise ValueError("--preview-posterior-samples cannot be negative")
-    if args.convergence_sse_tolerance < 0:
-        raise ValueError("--convergence-sse-tolerance cannot be negative")
     if args.convergence_rms_tolerance < 0:
         raise ValueError("--convergence-rms-tolerance cannot be negative")
     if args.convergence_max_tolerance < 0:
@@ -726,16 +716,6 @@ def interpolate_contour_x_at_y(
     return nearest["Rr"]
 
 
-def contour_sse(
-    previous: Sequence[dict[str, float]],
-    current: Sequence[dict[str, float]],
-    domain: Domain,
-    mode: str,
-) -> float | None:
-    metrics = contour_change_metrics(previous, current, domain, mode, 0.12)
-    return None if metrics is None else metrics["sse"]
-
-
 def contour_change_metrics(
     previous: Sequence[dict[str, float]],
     current: Sequence[dict[str, float]],
@@ -775,12 +755,11 @@ def contour_change_metrics(
                 add_delta(delta, fraction)
     if not deltas:
         return None
-    sse = sum(delta * delta for delta in deltas)
-    rms = math.sqrt(sse / len(deltas))
+    sum_sq = sum(delta * delta for delta in deltas)
+    rms = math.sqrt(sum_sq / len(deltas))
     max_delta = max(abs(delta) for delta in deltas)
     boundary_max = max((abs(delta) for delta in boundary_deltas), default=max_delta)
     return {
-        "sse": sse,
         "rms": rms,
         "max": max_delta,
         "boundary_max": boundary_max,
@@ -1611,8 +1590,7 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             )
             write_preview_contour(preview_path, preview_contour)
             if (
-                args.convergence_sse_tolerance > 0
-                or args.convergence_rms_tolerance > 0
+                args.convergence_rms_tolerance > 0
                 or args.convergence_max_tolerance > 0
                 or args.convergence_boundary_tolerance > 0
             ) and (
@@ -1629,11 +1607,6 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 stable = False
                 if metrics is not None:
                     stable = True
-                    if (
-                        args.convergence_sse_tolerance > 0
-                        and metrics["sse"] > args.convergence_sse_tolerance
-                    ):
-                        stable = False
                     if (
                         args.convergence_rms_tolerance > 0
                         and metrics["rms"] > args.convergence_rms_tolerance

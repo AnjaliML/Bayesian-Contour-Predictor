@@ -31,7 +31,6 @@ preview_points = 160
 preview_grid_size = 81
 preview_every = 5
 preview_posterior_samples = 0
-convergence_sse_tolerance = 0
 convergence_rms_tolerance = 0.0015
 convergence_max_tolerance = 0.008
 convergence_boundary_tolerance = 0.004
