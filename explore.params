@@ -3,6 +3,8 @@
 # Command-line flags override these values.
 
 seed = 11
+classifier = binary
+size_tolerance = 0.005
 iterations = 50
 initial_points = 20
 batch_size = 32

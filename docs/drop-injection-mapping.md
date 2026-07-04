@@ -105,4 +105,21 @@ This script keeps the drop-injection physical labels visible in the animation:
 - outlined points are the next proposed experiments.
 
 Under the hood, acquisition still flows through the generic `x,y,id` proposal
-engine, and each simulated experiment label is produced by `classify_drops.py`.
+engine. By default each simulated experiment label is produced by
+`classify_drops.py`.
+
+To use the size-threshold helper instead, run:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py --classifier size-based
+```
+
+or set this in [../explore.params](../explore.params):
+
+```text
+classifier = size-based
+size_tolerance = 0.005
+```
+
+The visualizer switches both the simulated labels and the dashed reference
+contour to the selected classifier.

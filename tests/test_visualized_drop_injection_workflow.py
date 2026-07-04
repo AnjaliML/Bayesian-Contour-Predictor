@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import classify_drops_sized_based as sized
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "end-to-end-with-visualization-drop-injection.py"
@@ -127,6 +129,51 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
             self.assertEqual(state["status"], "converged")
             self.assertLess(state["iteration"], state["total_iterations"])
             self.assertTrue(state["contour"])
+
+    def test_visualizer_can_use_size_based_classifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "visualizer-sized"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--classifier",
+                    "size-based",
+                    "--iterations",
+                    "1",
+                    "--initial-points",
+                    "4",
+                    "--batch-size",
+                    "3",
+                    "--n-repeats",
+                    "0",
+                    "--preview-points",
+                    "4",
+                    "--preview-grid-size",
+                    "5",
+                    "--grid-size",
+                    "5",
+                    "--posterior-samples",
+                    "0",
+                    "--delay",
+                    "0",
+                    "--no-server",
+                    "--no-browser",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+                check=True,
+            )
+
+            state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
+            first_true = state["true_contour"][0]
+
+            self.assertEqual(state["status"], "complete")
+            self.assertAlmostEqual(
+                first_true["Oh"],
+                sized.size_threshold_y(first_true["Rr"]),
+            )
+            self.assertEqual(len(self.read_rows(output_dir / "Sweep-1_completed.csv")), 3)
 
 
 if __name__ == "__main__":

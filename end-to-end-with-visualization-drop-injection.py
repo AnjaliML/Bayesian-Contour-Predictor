@@ -19,13 +19,17 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Sequence
 
-from classify_drops import oh_c
+from classify_drops import oh_c as binary_oh_c
+from classify_drops_sized_based import DEFAULT_SIZE_TOLERANCE, size_threshold_y
 import propose_next_sweep as sweep
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 PROPOSE_SCRIPT = REPO_ROOT / "propose_next_sweep.py"
-CLASSIFIER_SCRIPT = REPO_ROOT / "classify_drops.py"
+CLASSIFIER_SCRIPTS = {
+    "binary": REPO_ROOT / "classify_drops.py",
+    "size-based": REPO_ROOT / "classify_drops_sized_based.py",
+}
 DEFAULT_PARAMS_FILE = REPO_ROOT / "explore.params"
 
 
@@ -50,6 +54,8 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "n_new": None,
     "n_repeats": 3,
     "seed": 11,
+    "classifier": "binary",
+    "size_tolerance": DEFAULT_SIZE_TOLERANCE,
     "rr_min": 1.0,
     "rr_max": 100.0,
     "rr_scale": "log10",
@@ -83,6 +89,8 @@ PARAM_TYPES = {
     "n_new": optional_int,
     "n_repeats": optional_int,
     "seed": int,
+    "classifier": str,
+    "size_tolerance": float,
     "rr_min": float,
     "rr_max": float,
     "rr_scale": str,
@@ -187,7 +195,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Animate a drop-injection active-learning campaign by calling "
-            "propose_next_sweep.py and classify_drops.py under the hood."
+            "propose_next_sweep.py and a selected classifier under the hood."
         ),
         parents=[pre_parser],
     )
@@ -213,6 +221,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Repeat coordinates per sweep. Use 'auto' to let propose_next_sweep.py choose.",
     )
     parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument(
+        "--classifier",
+        choices=["binary", "size-based"],
+        default=defaults["classifier"],
+        help="Experiment runner used for simulated labels and the dashed reference contour.",
+    )
+    parser.add_argument(
+        "--size-tolerance",
+        type=float,
+        default=defaults["size_tolerance"],
+        help="Size threshold used by --classifier size-based.",
+    )
     parser.add_argument("--rr-min", type=float, default=defaults["rr_min"])
     parser.add_argument("--rr-max", type=float, default=defaults["rr_max"])
     parser.add_argument("--rr-scale", choices=["linear", "log10"], default=defaults["rr_scale"])
@@ -312,6 +332,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--n-new plus --n-repeats must equal --batch-size")
     if args.rr_min >= args.rr_max:
         raise ValueError("--rr-min must be less than --rr-max")
+    if args.size_tolerance < 0:
+        raise ValueError("--size-tolerance cannot be negative")
     if args.oh_min <= 0 or args.oh_min >= args.oh_max:
         raise ValueError("--oh-min must be positive and less than --oh-max")
     if args.rr_scale == "log10" and args.rr_min <= 0:
@@ -390,20 +412,51 @@ def value_at_fraction(lower: float, upper: float, fraction: float, scale: str) -
     return inverse_scaled_value(lower_t + fraction * (upper_t - lower_t), scale)
 
 
-def classify_drop(rr: float, oh: float) -> int:
+def classify_drop(
+    rr: float,
+    oh: float,
+    *,
+    classifier: str,
+    size_tolerance: float,
+) -> int:
+    if classifier == "binary":
+        command = [
+            sys.executable,
+            str(CLASSIFIER_SCRIPTS[classifier]),
+            format_float(oh),
+            format_float(rr),
+        ]
+    elif classifier == "size-based":
+        command = [
+            sys.executable,
+            str(CLASSIFIER_SCRIPTS[classifier]),
+            format_float(rr),
+            format_float(oh),
+            "--size-tolerance",
+            format_float(size_tolerance),
+        ]
+    else:
+        raise ValueError(f"unknown classifier {classifier!r}")
     result = subprocess.run(
-        [sys.executable, str(CLASSIFIER_SCRIPT), format_float(oh), format_float(rr)],
+        command,
         check=True,
         text=True,
         capture_output=True,
     )
     output = result.stdout.strip()
     if output not in {"0", "1"}:
-        raise RuntimeError(f"classify_drops.py returned unexpected output {output!r}")
+        raise RuntimeError(f"{CLASSIFIER_SCRIPTS[classifier].name} returned unexpected output {output!r}")
     return int(output)
 
 
-def make_initial_design(count: int, domain: Domain, seed: int) -> list[CompletedRun]:
+def make_initial_design(
+    count: int,
+    domain: Domain,
+    seed: int,
+    *,
+    classifier: str,
+    size_tolerance: float,
+) -> list[CompletedRun]:
     rng = random.Random(seed)
     rr_slots = list(range(count))
     oh_slots = list(range(count))
@@ -416,7 +469,12 @@ def make_initial_design(count: int, domain: Domain, seed: int) -> list[Completed
         oh_fraction = (oh_slots[index] + 0.5) / count
         rr = value_at_fraction(domain.rr_min, domain.rr_max, rr_fraction, domain.rr_scale)
         oh = value_at_fraction(domain.oh_min, domain.oh_max, oh_fraction, domain.oh_scale)
-        label = classify_drop(rr, oh)
+        label = classify_drop(
+            rr,
+            oh,
+            classifier=classifier,
+            size_tolerance=size_tolerance,
+        )
         runs.append(
             CompletedRun(
                 case_id=str(index + 1),
@@ -532,7 +590,11 @@ def proposal_from_row(row: dict[str, str]) -> ProposedRun:
 
 
 def proposal_rows_to_completed(
-    rows: Sequence[dict[str, str]], sweep: int
+    rows: Sequence[dict[str, str]],
+    sweep: int,
+    *,
+    classifier: str,
+    size_tolerance: float,
 ) -> list[CompletedRun]:
     completed: list[CompletedRun] = []
     for row in rows:
@@ -543,19 +605,42 @@ def proposal_rows_to_completed(
                 case_id=row["caseId"],
                 rr=rr,
                 oh=oh,
-                label=classify_drop(rr, oh),
+                label=classify_drop(
+                    rr,
+                    oh,
+                    classifier=classifier,
+                    size_tolerance=size_tolerance,
+                ),
                 sweep=sweep,
             )
         )
     return completed
 
 
-def find_true_contour(domain: Domain, samples: int = 80) -> list[dict[str, float]]:
+def true_contour_y(rr: float, *, classifier: str, size_tolerance: float) -> float:
+    if classifier == "binary":
+        return binary_oh_c(rr)
+    if classifier == "size-based":
+        return size_threshold_y(rr, size_tolerance)
+    raise ValueError(f"unknown classifier {classifier!r}")
+
+
+def find_true_contour(
+    domain: Domain,
+    *,
+    classifier: str,
+    size_tolerance: float,
+    samples: int = 80,
+) -> list[dict[str, float]]:
     contour: list[dict[str, float]] = []
     for index in range(samples):
         fraction = index / (samples - 1) if samples > 1 else 0.5
         rr = value_at_fraction(domain.rr_min, domain.rr_max, fraction, domain.rr_scale)
-        oh = oh_c(rr)
+        oh = true_contour_y(
+            rr,
+            classifier=classifier,
+            size_tolerance=size_tolerance,
+        )
         if domain.oh_min <= oh <= domain.oh_max:
             contour.append({"Rr": rr, "Oh": oh})
     return contour
@@ -1598,8 +1683,15 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
 
     messages: list[str] = []
     history: list[dict[str, Any]] = []
-    true_contour = find_true_contour(domain)
-    messages.append("Built the reference classifier contour using classify_drops.py.")
+    true_contour = find_true_contour(
+        domain,
+        classifier=args.classifier,
+        size_tolerance=args.size_tolerance,
+    )
+    messages.append(
+        "Built the reference classifier contour using "
+        f"{CLASSIFIER_SCRIPTS[args.classifier].name}."
+    )
     update_visual_state(
         output_dir,
         status="starting",
@@ -1625,7 +1717,13 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         if not args.no_browser:
             webbrowser.open(url)
 
-    all_completed = make_initial_design(args.initial_points, domain, args.seed)
+    all_completed = make_initial_design(
+        args.initial_points,
+        domain,
+        args.seed,
+        classifier=args.classifier,
+        size_tolerance=args.size_tolerance,
+    )
     completed_files: list[Path] = [output_dir / "Sweep-0_completed.csv"]
     write_completed_sweep(completed_files[0], all_completed)
     messages.append(f"Generated and classified {len(all_completed)} initial space-filling runs.")
@@ -1769,7 +1867,12 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
 
         newly_completed: list[CompletedRun] = []
         for row in proposal_rows:
-            run = proposal_rows_to_completed([row], iteration)[0]
+            run = proposal_rows_to_completed(
+                [row],
+                iteration,
+                classifier=args.classifier,
+                size_tolerance=args.size_tolerance,
+            )[0]
             newly_completed.append(run)
             all_completed.append(run)
             update_visual_state(
