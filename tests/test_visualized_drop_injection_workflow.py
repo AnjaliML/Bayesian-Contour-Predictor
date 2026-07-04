@@ -50,10 +50,14 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
             )
 
             state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
+            html = (output_dir / "index.html").read_text(encoding="utf-8")
             proposed_rows = self.read_rows(output_dir / "Sweep-1_proposed.csv")
             completed_rows = self.read_rows(output_dir / "Sweep-1_completed.csv")
 
             self.assertTrue((output_dir / "index.html").exists())
+            self.assertIn("RUNNING - not converged yet", html)
+            self.assertIn("CONVERGED", html)
+            self.assertIn("COMPLETED", html)
             self.assertEqual(state["status"], "complete")
             self.assertEqual(state["iteration"], 1)
             self.assertEqual(state["total_iterations"], 1)

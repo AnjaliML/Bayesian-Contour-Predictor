@@ -906,6 +906,35 @@ def write_html(output_dir: Path) -> None:
       color: var(--muted);
       font-size: 13px;
     }
+    .run-state {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      margin-top: 8px;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+      font-weight: 760;
+      letter-spacing: 0;
+      border: 1px solid var(--line);
+      background: #f7faf9;
+      color: var(--muted);
+    }
+    .run-state-running {
+      border-color: rgba(46, 99, 211, 0.28);
+      background: rgba(46, 99, 211, 0.08);
+      color: var(--curve);
+    }
+    .run-state-converged {
+      border-color: rgba(15, 128, 101, 0.28);
+      background: rgba(15, 128, 101, 0.10);
+      color: var(--drop);
+    }
+    .run-state-completed {
+      border-color: rgba(32, 41, 51, 0.22);
+      background: #f1f4f3;
+      color: var(--ink);
+    }
     .progress-wrap {
       display: grid;
       gap: 8px;
@@ -995,6 +1024,24 @@ def write_html(output_dir: Path) -> None:
     .stat span {
       color: var(--muted);
       font-size: 12px;
+    }
+    .status-panel {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fcfdfc;
+      margin-bottom: 14px;
+    }
+    .status-panel b {
+      display: block;
+      font-size: 15px;
+      line-height: 1.25;
+      margin-bottom: 4px;
+    }
+    .status-panel span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
     }
     h2 {
       font-size: 13px;
@@ -1109,6 +1156,7 @@ def write_html(output_dir: Path) -> None:
     <div class="title-block">
       <h1>Drop Injection Active Learning</h1>
       <div id="subtitle">Waiting for campaign state...</div>
+      <div id="runStateBadge" class="run-state">WAITING</div>
     </div>
     <div class="progress-wrap">
       <div class="progress-meta">
@@ -1132,6 +1180,10 @@ def write_html(output_dir: Path) -> None:
         <div class="stat"><b id="completed">0</b><span>Completed runs</span></div>
         <div class="stat"><b id="drops">0</b><span>Drops</span></div>
         <div class="stat"><b id="pending">0</b><span>Current proposals</span></div>
+      </div>
+      <div id="statusPanel" class="status-panel">
+        <b id="statusLabel">Waiting for campaign state</b>
+        <span id="statusDetail">The visualizer will mark convergence or completion here.</span>
       </div>
       <h2>Sweep Timeline</h2>
       <div id="timeline" class="timeline"></div>
@@ -1393,11 +1445,42 @@ function draw() {
   drawPlotSummary(state, s);
 }
 
+function campaignRunState(state) {
+  const total = state.total_iterations || state.iteration || 0;
+  const status = String(state.status || "").toLowerCase();
+  if (status === "converged") {
+    return {
+      kind: "converged",
+      label: "CONVERGED",
+      detail: "Stopped early because contour movement stayed below the configured tolerances.",
+    };
+  }
+  if (status === "complete") {
+    return {
+      kind: "completed",
+      label: "COMPLETED",
+      detail: "Reached the configured sweep limit. This is a completed campaign, not an early convergence stop.",
+    };
+  }
+  const progress = total ? `${state.iteration} of ${total} sweeps complete` : "campaign in progress";
+  return {
+    kind: "running",
+    label: "RUNNING - not converged yet",
+    detail: `${progress}; latest status is "${state.status || "starting"}".`,
+  };
+}
+
 function updateSidebar(state) {
   const drops = state.completed.filter(p => p.id === 1).length;
   const total = state.total_iterations || state.iteration || 0;
   const pct = total ? Math.min(100, Math.round(state.iteration / total * 100)) : 0;
-  document.getElementById("subtitle").textContent = `${state.status} | updated ${state.updated_at}`;
+  const runState = campaignRunState(state);
+  document.getElementById("subtitle").textContent = `${runState.label} | ${state.status} | updated ${state.updated_at}`;
+  const badge = document.getElementById("runStateBadge");
+  badge.textContent = runState.label;
+  badge.className = `run-state run-state-${runState.kind}`;
+  document.getElementById("statusLabel").textContent = runState.label;
+  document.getElementById("statusDetail").textContent = runState.detail;
   document.getElementById("iteration").textContent = `${state.iteration}/${total}`;
   document.getElementById("completed").textContent = state.completed.length;
   document.getElementById("drops").textContent = drops;
