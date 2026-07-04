@@ -49,6 +49,28 @@ The older `classify_drops.py` helper evaluates one fixed hand-coded transition:
 Oh_c(Rr) = 0.0326 - 0.0398 exp(-0.348 Rr)
 ```
 
+`classify_drops_sized_based.py` evaluates a continuous size first, still using
+generic `x,y` inputs:
+
+```text
+x = Rr
+y = Oh
+r_d = 0.2 * (1 - sqrt(y / y_c(x)))
+id = 1 if r_d > 5e-3 else 0
+```
+
+Negative `r_d` values are clamped to `0`, so the helper never reports a
+negative physical size.
+
+The implied binary threshold contour is:
+
+```text
+y = (1 - 5e-3 / 0.2)^2 * y_c(x)
+```
+
+So the existing binary active learner can be used first by converting measured
+sizes to `id` with a configured size tolerance.
+
 The new proposal engine is different: it learns a contour from campaign data
 and proposes the next informative experiments.
 
