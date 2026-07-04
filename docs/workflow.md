@@ -87,7 +87,8 @@ or a denser display preview before jumping straight to hundreds of sweeps. A
 typical refinement run is the default `--iterations 120 --batch-size 16 --n-repeats 3`,
 which spends most of the extra budget on new coordinates while keeping a few
 noise-check repeats. The visualizer also sets `length_scale_x = 0.18` by default,
-which reduces over-smoothing near the lower log-scale edge.
+uses `contour_fit = adaptive-linear`, and adds explicit edge bracket probes to
+reduce over-smoothing near log-scale boundaries.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.
@@ -115,8 +116,10 @@ k = number of positive outcomes
 p_hat = k / n
 ```
 
-The script deliberately proposes repeats near the inferred contour, especially
-where existing labels disagree or only one run exists at an important point.
+The script deliberately proposes repeats near the inferred contour when repeats
+are enabled. For new coordinates, it also bisects observed `id = 1` / `id = 0`
+brackets and stratifies selections across the `x` range so one dense region
+does not consume the whole batch.
 
 ## Stopping
 
@@ -128,8 +131,9 @@ Common stopping checks:
 - The contour resolution is fine enough for the downstream paper or design use.
 
 The visualizer can stop automatically before `iterations` is exhausted. It
-compares consecutive learned contours on the preview grid and stops when the
-transformed SSE stays below `convergence_sse_tolerance` for
-`convergence_patience` checks after `convergence_min_iterations` sweeps. Set
-`convergence_sse_tolerance = 0` to disable this early stop. `convergence_mode`
-can compare `y`, inverse `x`, or `both` views of the contour.
+compares consecutive learned contours on the preview grid and stops when RMS
+movement, maximum pointwise movement, and edge-region movement stay below their
+configured tolerances for `convergence_patience` checks after
+`convergence_min_iterations` sweeps. `convergence_mode` can compare `y`,
+inverse `x`, or `both` views of the contour. `convergence_sse_tolerance` is
+kept as a legacy optional stop check and can stay `0`.

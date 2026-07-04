@@ -73,6 +73,7 @@ class Domain:
 class ModelConfig:
     mode: str
     monotone_direction: str
+    contour_fit: str
     x_scale: str
     y_scale: str
     transition_width: float
@@ -351,6 +352,23 @@ def monotone_probability(
 ) -> float:
     y_t = transformed_y(y, y_scale)
     y_c_t = transformed_y(y_c, y_scale)
+    return monotone_probability_transformed(
+        y_t,
+        y_c_t,
+        direction=direction,
+        transition_width=transition_width,
+        label_noise=label_noise,
+    )
+
+
+def monotone_probability_transformed(
+    y_t: float,
+    y_c_t: float,
+    *,
+    direction: str,
+    transition_width: float,
+    label_noise: float,
+) -> float:
     if direction == "decreasing":
         margin = (y_c_t - y_t) / transition_width
     else:
@@ -438,7 +456,48 @@ def monotone_negative_log_likelihood_weighted(
     return loss
 
 
-def estimate_monotone_y_c(
+def monotone_negative_log_likelihood_linear(
+    y_c_t: float,
+    slope: float,
+    query_x_t: float,
+    weighted_points: Sequence[tuple[AggregatePoint, float]],
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    loss = 0.0
+    for point, weight in weighted_points:
+        rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
+        k = point.n * rate
+        point_y_c_t = y_c_t + slope * (transformed_x(point.x, config) - query_x_t)
+        p = clamp(
+            monotone_probability_transformed(
+                transformed_y(point.y, config.y_scale),
+                point_y_c_t,
+                direction=config.monotone_direction,
+                transition_width=config.transition_width,
+                label_noise=config.label_noise,
+            ),
+            1e-9,
+            1.0 - 1e-9,
+        )
+        loss -= weight * (k * math.log(p) + (point.n - k) * math.log(1.0 - p))
+    return loss
+
+
+def local_linear_slope_limit(domain: Domain, config: ModelConfig) -> float:
+    x_span = max(
+        transformed_span(domain.x_min, domain.x_max, config.x_scale, "x"),
+        1e-12,
+    )
+    y_span = max(
+        transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"),
+        1e-12,
+    )
+    return 3.0 * y_span / x_span
+
+
+def estimate_monotone_y_c_local_constant(
     x: float,
     aggregates: Sequence[AggregatePoint],
     domain: Domain,
@@ -473,6 +532,95 @@ def estimate_monotone_y_c(
         bracket_upper,
     )
     return inverse_transformed_y(best_t, config.y_scale)
+
+
+def estimate_monotone_y_c_local_linear(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    lower = transformed_y(domain.y_min, config.y_scale)
+    upper = transformed_y(domain.y_max, config.y_scale)
+    weighted_points = weighted_points_for_x(x, aggregates, domain, config)
+    if len(weighted_points) < 3:
+        return estimate_monotone_y_c_local_constant(
+            x, aggregates, domain, config, sampled_rates=sampled_rates
+        )
+
+    query_x_t = transformed_x(x, config)
+    base_candidates = linspace(lower, upper, max(config.grid_size, 5))
+    slope_limit = local_linear_slope_limit(domain, config)
+    slope_candidates = linspace(-slope_limit, slope_limit, 9)
+
+    def loss(base_t: float, slope: float) -> float:
+        return monotone_negative_log_likelihood_linear(
+            base_t,
+            slope,
+            query_x_t,
+            weighted_points,
+            config,
+            sampled_rates=sampled_rates,
+        )
+
+    best_base = base_candidates[0]
+    best_slope = 0.0
+    best_loss = math.inf
+    for base_t in base_candidates:
+        for slope in slope_candidates:
+            candidate_loss = loss(base_t, slope)
+            if candidate_loss < best_loss:
+                best_base = base_t
+                best_slope = slope
+                best_loss = candidate_loss
+
+    slope_step = (2.0 * slope_limit) / max(len(slope_candidates) - 1, 1)
+    for _ in range(2):
+        best_base = minimize_bounded(lambda value: loss(value, best_slope), lower, upper)
+        slope_lower = max(-slope_limit, best_slope - slope_step)
+        slope_upper = min(slope_limit, best_slope + slope_step)
+        best_slope = minimize_bounded(
+            lambda value: loss(best_base, value),
+            slope_lower,
+            slope_upper,
+            iterations=12,
+        )
+
+    return inverse_transformed_y(clamp(best_base, lower, upper), config.y_scale)
+
+
+def estimate_monotone_y_c(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
+) -> float:
+    exact_points = [
+        point
+        for point in aggregates
+        if abs(transformed_x(point.x, config) - transformed_x(x, config)) <= 1e-12
+    ]
+    exact_bracket = bracket_midpoint_from_points(exact_points, domain, config)
+    if exact_bracket is not None:
+        y, gap_fraction = exact_bracket
+        if gap_fraction <= 0.20:
+            return y
+
+    use_local_linear = config.contour_fit == "local-linear" or (
+        config.contour_fit == "adaptive-linear"
+        and boundary_focus(x, domain, config) > 0.0
+    )
+    if use_local_linear:
+        return estimate_monotone_y_c_local_linear(
+            x, aggregates, domain, config, sampled_rates=sampled_rates
+        )
+    return estimate_monotone_y_c_local_constant(
+        x, aggregates, domain, config, sampled_rates=sampled_rates
+    )
 
 
 def estimate_generic_y_c(
@@ -661,6 +809,242 @@ def x_gap_score(
     return clamp(max(containing_gap, nearest_x_distance) / max(x_span, 1e-12), 0.0, 1.0)
 
 
+def x_bin_index(
+    x: float, domain: Domain, config: ModelConfig, bin_count: int
+) -> int:
+    lower = transformed_value(domain.x_min, config.x_scale, "x")
+    upper = transformed_value(domain.x_max, config.x_scale, "x")
+    span = max(upper - lower, 1e-12)
+    fraction = (transformed_x(x, config) - lower) / span
+    return min(max(int(fraction * bin_count), 0), bin_count - 1)
+
+
+def x_bin_counts(
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    bin_count: int,
+) -> list[int]:
+    counts = [0 for _ in range(bin_count)]
+    for point in aggregates:
+        counts[x_bin_index(point.x, domain, config, bin_count)] += point.n
+    return counts
+
+
+def x_bin_scarcity_score(
+    x: float,
+    bin_counts: Sequence[int],
+    domain: Domain,
+    config: ModelConfig,
+) -> float:
+    if not bin_counts:
+        return 0.0
+    count = bin_counts[x_bin_index(x, domain, config, len(bin_counts))]
+    max_count = max(bin_counts) or 1
+    return clamp(1.0 - count / max_count, 0.0, 1.0)
+
+
+def bracket_midpoint_from_points(
+    points: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
+) -> tuple[float, float] | None:
+    y_span = max(transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"), 1e-12)
+    positives: list[float] = []
+    negatives: list[float] = []
+    for point in points:
+        if point.rate > 0.5:
+            positives.append(transformed_y(point.y, config.y_scale))
+        elif point.rate < 0.5:
+            negatives.append(transformed_y(point.y, config.y_scale))
+    if not positives or not negatives:
+        return None
+
+    if config.monotone_direction == "decreasing":
+        lower_side = max(positives)
+        upper_side = min(negatives)
+    else:
+        lower_side = max(negatives)
+        upper_side = min(positives)
+    if lower_side >= upper_side:
+        return None
+
+    midpoint = (lower_side + upper_side) / 2.0
+    gap_fraction = clamp((upper_side - lower_side) / y_span, 0.0, 1.0)
+    return inverse_transformed_value(midpoint, config.y_scale), gap_fraction
+
+
+def bracket_midpoint_candidates(
+    aggregates: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
+) -> list[tuple[float, float, float]]:
+    by_x: dict[float, list[AggregatePoint]] = {}
+    for point in aggregates:
+        by_x.setdefault(point.x, []).append(point)
+
+    candidates: list[tuple[float, float, float]] = []
+    for x, points in by_x.items():
+        midpoint = bracket_midpoint_from_points(points, domain, config)
+        if midpoint is not None:
+            y, gap_fraction = midpoint
+            candidates.append((x, y, gap_fraction))
+
+    candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
+    return candidates
+
+
+def edge_bracket_candidates(
+    aggregates: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
+) -> list[tuple[float, float, float]]:
+    y_lower = transformed_y(domain.y_min, config.y_scale)
+    y_upper = transformed_y(domain.y_max, config.y_scale)
+    y_span = max(y_upper - y_lower, 1e-12)
+    candidates: list[tuple[float, float, float]] = []
+    for edge_x in (domain.x_min, domain.x_max):
+        points = [
+            point
+            for point in aggregates
+            if abs(transformed_x(point.x, config) - transformed_x(edge_x, config))
+            <= 1e-12
+        ]
+        if not points:
+            continue
+        bracket = bracket_midpoint_from_points(points, domain, config)
+        if bracket is not None:
+            y, gap_fraction = bracket
+            candidates.append((edge_x, y, gap_fraction))
+            continue
+
+        positives = [
+            transformed_y(point.y, config.y_scale)
+            for point in points
+            if point.rate > 0.5
+        ]
+        negatives = [
+            transformed_y(point.y, config.y_scale)
+            for point in points
+            if point.rate < 0.5
+        ]
+        if config.monotone_direction == "decreasing":
+            if negatives and not positives:
+                reference = min(negatives)
+                probe = (y_lower + reference) / 2.0
+            elif positives and not negatives:
+                reference = max(positives)
+                probe = (reference + y_upper) / 2.0
+            else:
+                continue
+        else:
+            if positives and not negatives:
+                reference = min(positives)
+                probe = (y_lower + reference) / 2.0
+            elif negatives and not positives:
+                reference = max(negatives)
+                probe = (reference + y_upper) / 2.0
+            else:
+                continue
+        candidates.append(
+            (
+                edge_x,
+                inverse_transformed_value(clamp(probe, y_lower, y_upper), config.y_scale),
+                clamp(abs(probe - reference) / y_span, 0.0, 1.0),
+            )
+        )
+    candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
+    return candidates
+
+
+def local_bracket_midpoint_candidate(
+    x: float,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+) -> tuple[float, float] | None:
+    weighted = weighted_points_for_x(x, aggregates, domain, config)
+    if not weighted:
+        return None
+    max_weight = max(weight for _, weight in weighted)
+    local_points = [
+        point
+        for point, weight in weighted
+        if weight >= max(max_weight * 0.12, 1e-6)
+    ]
+    if len(local_points) < 2:
+        return None
+    return bracket_midpoint_from_points(local_points, domain, config)
+
+
+def far_enough_from_selected(
+    proposal: Proposal,
+    selected: Sequence[Proposal],
+    domain: Domain,
+    config: ModelConfig,
+) -> bool:
+    x_span = max(transformed_span(domain.x_min, domain.x_max, config.x_scale, "x"), 1e-12)
+    y_span = max(transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"), 1e-12)
+    return all(
+        math.hypot(
+            (
+                transformed_value(proposal.x, config.x_scale, "x")
+                - transformed_value(chosen.x, config.x_scale, "x")
+            )
+            / x_span,
+            (
+                transformed_value(proposal.y, config.y_scale, "y")
+                - transformed_value(chosen.y, config.y_scale, "y")
+            )
+            / y_span,
+        )
+        >= 0.03
+        for chosen in selected
+    )
+
+
+def select_stratified_proposals(
+    proposals: Sequence[Proposal],
+    domain: Domain,
+    config: ModelConfig,
+    count: int,
+) -> list[Proposal]:
+    if count <= 0:
+        return []
+    bin_count = max(1, min(count, 12))
+    grouped: dict[int, list[Proposal]] = {index: [] for index in range(bin_count)}
+    for proposal in proposals:
+        grouped[x_bin_index(proposal.x, domain, config, bin_count)].append(proposal)
+    for group in grouped.values():
+        group.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
+
+    selected: list[Proposal] = []
+    while len(selected) < count:
+        progressed = False
+        active_bins = sorted(
+            (index for index, group in grouped.items() if group),
+            key=lambda index: -grouped[index][0].score,
+        )
+        if not active_bins:
+            break
+        for index in active_bins:
+            group = grouped[index]
+            while group:
+                candidate = group.pop(0)
+                if far_enough_from_selected(candidate, selected, domain, config):
+                    selected.append(candidate)
+                    progressed = True
+                    break
+            if len(selected) >= count:
+                break
+        if not progressed:
+            break
+
+    if len(selected) < count:
+        for proposal in sorted(proposals, key=lambda item: (-item.score, item.x, item.y)):
+            if proposal in selected:
+                continue
+            if far_enough_from_selected(proposal, selected, domain, config):
+                selected.append(proposal)
+            if len(selected) >= count:
+                break
+    return selected
+
+
 def choose_batch_counts(
     n_simulations: int,
     n_new: int | None,
@@ -763,16 +1147,19 @@ def candidate_x_values(
     upper = transformed_value(domain.x_max, config.x_scale, "x")
     base = [inverse_transformed_value(value, config.x_scale) for value in linspace(lower, upper, count)]
     xs = sorted({point.x for point in aggregates})
-    midpoints = [
-        inverse_transformed_value(
+    midpoint_candidates: list[tuple[float, float]] = []
+    for left, right in zip(xs, xs[1:]):
+        left_t = transformed_value(left, config.x_scale, "x")
+        right_t = transformed_value(right, config.x_scale, "x")
+        midpoint_candidates.append(
             (
-                transformed_value(left, config.x_scale, "x")
-                + transformed_value(right, config.x_scale, "x")
+                right_t - left_t,
+                inverse_transformed_value((left_t + right_t) / 2.0, config.x_scale),
             )
-            / 2.0,
-            config.x_scale,
         )
-        for left, right in zip(xs, xs[1:])
+    midpoints = [
+        midpoint
+        for _, midpoint in sorted(midpoint_candidates, reverse=True)[: max(count, 1)]
     ]
     values = [*base, *midpoints]
     deduped: list[float] = []
@@ -946,6 +1333,12 @@ def propose_new_points(
     proposals: list[Proposal] = []
     x_values = candidate_x_values(domain, aggregates, config, max(config.grid_size, count * 4))
     contour_cache: dict[float, ContourEstimate] = {}
+    scarcity_bins = x_bin_counts(
+        aggregates,
+        domain,
+        config,
+        max(1, min(max(count, 4), 12)),
+    )
 
     def contour_for(x: float) -> ContourEstimate:
         if x not in contour_cache:
@@ -958,6 +1351,7 @@ def propose_new_points(
         *,
         source: str,
         vertical_probe: float,
+        bracket_gap: float = 0.0,
     ) -> None:
         n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
         if n_existing:
@@ -986,21 +1380,32 @@ def propose_new_points(
             clamp(vertical_gap / (0.10 * y_span), 0.0, 1.0),
         )
         inverse_locator = 1.0 if source == "x-from-y locator" else 0.0
+        bracket_midpoint = 1.0 if "bracket" in source else 0.0
+        x_scarcity = x_bin_scarcity_score(x, scarcity_bins, domain, config)
         score = (
-            0.30 * near_contour
-            + 0.22 * contour_uncertainty
-            + 0.17 * gap
-            + 0.13 * novelty
+            0.24 * near_contour
+            + 0.18 * contour_uncertainty
+            + 0.14 * gap
+            + 0.10 * novelty
             + 0.05 * p_std
             + 0.08 * edge_focus
-            + 0.22 * edge_focus * adaptive_vertical_probe
+            + 0.18 * edge_focus * adaptive_vertical_probe
             + 0.08 * inverse_locator
+            + 0.25 * bracket_midpoint
+            + 0.15 * bracket_gap
+            + 0.10 * x_scarcity
         )
         reasons = ["new coordinate near predicted contour"]
+        if source == "edge bracket expansion":
+            reasons.append("expands one-sided edge bracket")
+        elif "bracket" in source:
+            reasons.append("bisects observed label bracket")
         if source == "x-from-y locator":
             reasons.append("adaptive x-from-y locator")
         if gap >= 0.25:
             reasons.append("large gap in sampled x values")
+        if x_scarcity >= 0.5:
+            reasons.append("under-sampled x stratum")
         if contour_uncertainty >= 0.05:
             reasons.append("high local contour uncertainty")
         if novelty >= 0.75:
@@ -1021,7 +1426,35 @@ def propose_new_points(
             )
         )
 
+    for x, y, gap_fraction in edge_bracket_candidates(aggregates, domain, config):
+        add_candidate(
+            x,
+            y,
+            source="edge bracket expansion",
+            vertical_probe=gap_fraction,
+            bracket_gap=gap_fraction,
+        )
+
+    for x, y, gap_fraction in bracket_midpoint_candidates(aggregates, domain, config):
+        add_candidate(
+            x,
+            y,
+            source="exact label bracket midpoint",
+            vertical_probe=gap_fraction,
+            bracket_gap=gap_fraction,
+        )
+
     for x in x_values:
+        bracket = local_bracket_midpoint_candidate(x, aggregates, domain, config)
+        if bracket is not None:
+            y, gap_fraction = bracket
+            add_candidate(
+                x,
+                y,
+                source="local label bracket midpoint",
+                vertical_probe=gap_fraction,
+                bracket_gap=gap_fraction,
+            )
         contour = contour_for(x)
         edge_focus = boundary_focus(x, domain, config)
         for y, vertical_probe in y_probe_values_near_contour(
@@ -1035,28 +1468,7 @@ def propose_new_points(
             add_candidate(x, y, source="x-from-y locator", vertical_probe=0.0)
 
     proposals.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
-    selected: list[Proposal] = []
-    for proposal in proposals:
-        if len(selected) >= count:
-            break
-        if all(
-            math.hypot(
-                (
-                    transformed_value(proposal.x, config.x_scale, "x")
-                    - transformed_value(chosen.x, config.x_scale, "x")
-                )
-                / max(transformed_span(domain.x_min, domain.x_max, config.x_scale, "x"), 1e-12),
-                (
-                    transformed_value(proposal.y, config.y_scale, "y")
-                    - transformed_value(chosen.y, config.y_scale, "y")
-                )
-                / max(transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"), 1e-12),
-            )
-            >= 0.03
-            for chosen in selected
-        ):
-            selected.append(proposal)
-    return selected
+    return select_stratified_proposals(proposals, domain, config, count)
 
 
 def propose_next_batch(
@@ -1193,6 +1605,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--y-max", type=float)
     parser.add_argument("--mode", choices=["generic", "monotone-y"], default="generic")
     parser.add_argument(
+        "--contour-fit",
+        choices=["local-constant", "local-linear", "adaptive-linear"],
+        default="adaptive-linear",
+        help="Local contour model used when --mode monotone-y is selected.",
+    )
+    parser.add_argument(
         "--monotone-direction",
         choices=["decreasing", "increasing"],
         default="decreasing",
@@ -1253,6 +1671,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = ModelConfig(
             mode=args.mode,
             monotone_direction=args.monotone_direction,
+            contour_fit=args.contour_fit,
             x_scale=args.x_scale,
             y_scale=args.y_scale,
             transition_width=args.transition_width,

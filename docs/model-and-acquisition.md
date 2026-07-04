@@ -55,6 +55,22 @@ linear `Rr` interval dominate the acquisition geometry.
 Use `--monotone-direction increasing` when the positive regime becomes more
 likely as `y` increases.
 
+`--contour-fit` controls the local contour model used in monotone-y mode:
+
+- `local-constant`: fit one local `y_c` value at each candidate `x`.
+- `local-linear`: fit a local line in transformed `x`/`y` space.
+- `adaptive-linear`: use local-linear fitting near `x` domain edges and
+  local-constant fitting elsewhere.
+
+The default is `adaptive-linear`, which keeps the process-agnostic model but
+reduces one-sided boundary bias without paying the full local-linear cost at
+every interior candidate.
+
+When completed data at an exact `x` already bracket the transition with both
+`id = 1` and `id = 0`, tight brackets constrain the fitted contour at that
+same `x`. This is still a monotone binary-contour rule, not a rule tied to any
+particular physical process.
+
 ## Uncertainty
 
 The script samples aggregate point rates from their Beta posteriors and refits
@@ -97,3 +113,12 @@ locations and inverse `x` from sampled `y` levels. The inverse locator helps
 probe boundary regions where the current `Y(x)` contour sits too high or too low
 and the next useful experiment is a vertical bracket rather than another point
 on the current line.
+
+The monotone acquisition also proposes bracket refinements:
+
+- exact bracket bisection when the same `x` has observed labels on both sides,
+- local bracket bisection from nearby `x` neighborhoods,
+- edge bracket expansion when a domain edge has only one observed label so far.
+
+Final new-coordinate selection is stratified across transformed `x` bins, so a
+dense or high-scoring region cannot consume the entire batch.

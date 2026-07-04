@@ -58,13 +58,20 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "oh_scale": "log10",
     "grid_size": 15,
     "posterior_samples": 0,
+    "transition_width": 0.04,
+    "label_noise": 0.005,
+    "contour_fit": "adaptive-linear",
     "length_scale_x": 0.18,
     "length_scale_y": None,
     "preview_points": 120,
     "preview_grid_size": 61,
     "preview_every": 10,
     "preview_posterior_samples": 0,
-    "convergence_sse_tolerance": 0.0005,
+    "convergence_sse_tolerance": 0.0,
+    "convergence_rms_tolerance": 0.0015,
+    "convergence_max_tolerance": 0.008,
+    "convergence_boundary_tolerance": 0.004,
+    "convergence_boundary_fraction": 0.12,
     "convergence_patience": 3,
     "convergence_min_iterations": 30,
     "convergence_mode": "both",
@@ -85,6 +92,9 @@ PARAM_TYPES = {
     "oh_scale": str,
     "grid_size": int,
     "posterior_samples": int,
+    "transition_width": float,
+    "label_noise": float,
+    "contour_fit": str,
     "length_scale_x": optional_float,
     "length_scale_y": optional_float,
     "preview_points": int,
@@ -92,6 +102,10 @@ PARAM_TYPES = {
     "preview_every": int,
     "preview_posterior_samples": int,
     "convergence_sse_tolerance": float,
+    "convergence_rms_tolerance": float,
+    "convergence_max_tolerance": float,
+    "convergence_boundary_tolerance": float,
+    "convergence_boundary_fraction": float,
     "convergence_patience": int,
     "convergence_min_iterations": int,
     "convergence_mode": str,
@@ -209,6 +223,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--oh-scale", choices=["linear", "log10"], default=defaults["oh_scale"])
     parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
     parser.add_argument("--posterior-samples", type=int, default=defaults["posterior_samples"])
+    parser.add_argument("--transition-width", type=float, default=defaults["transition_width"])
+    parser.add_argument("--label-noise", type=float, default=defaults["label_noise"])
+    parser.add_argument(
+        "--contour-fit",
+        choices=["local-constant", "local-linear", "adaptive-linear"],
+        default=defaults["contour_fit"],
+    )
     parser.add_argument("--length-scale-x", type=optional_float, default=defaults["length_scale_x"])
     parser.add_argument("--length-scale-y", type=optional_float, default=defaults["length_scale_y"])
     parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
@@ -223,7 +244,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--convergence-sse-tolerance",
         type=float,
         default=defaults["convergence_sse_tolerance"],
-        help="Stop early when contour SSE remains below this value. Use 0 to disable.",
+        help="Legacy early stop on transformed contour SSE. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--convergence-rms-tolerance",
+        type=float,
+        default=defaults["convergence_rms_tolerance"],
+        help="Stop early when RMS transformed contour movement remains below this value.",
+    )
+    parser.add_argument(
+        "--convergence-max-tolerance",
+        type=float,
+        default=defaults["convergence_max_tolerance"],
+        help="Stop early only if the largest pointwise contour movement is below this value.",
+    )
+    parser.add_argument(
+        "--convergence-boundary-tolerance",
+        type=float,
+        default=defaults["convergence_boundary_tolerance"],
+        help="Stop early only if edge-region contour movement is below this value.",
+    )
+    parser.add_argument(
+        "--convergence-boundary-fraction",
+        type=float,
+        default=defaults["convergence_boundary_fraction"],
+        help="Fraction of each x/y edge tracked by the boundary convergence check.",
     )
     parser.add_argument(
         "--convergence-patience",
@@ -285,6 +330,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grid-size must be at least 5")
     if args.posterior_samples < 0:
         raise ValueError("--posterior-samples cannot be negative")
+    if args.transition_width <= 0:
+        raise ValueError("--transition-width must be positive")
+    if not 0 <= args.label_noise < 0.5:
+        raise ValueError("--label-noise must be in [0, 0.5)")
     if args.length_scale_x is not None and args.length_scale_x <= 0:
         raise ValueError("--length-scale-x must be positive or auto")
     if args.length_scale_y is not None and args.length_scale_y <= 0:
@@ -299,6 +348,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--preview-posterior-samples cannot be negative")
     if args.convergence_sse_tolerance < 0:
         raise ValueError("--convergence-sse-tolerance cannot be negative")
+    if args.convergence_rms_tolerance < 0:
+        raise ValueError("--convergence-rms-tolerance cannot be negative")
+    if args.convergence_max_tolerance < 0:
+        raise ValueError("--convergence-max-tolerance cannot be negative")
+    if args.convergence_boundary_tolerance < 0:
+        raise ValueError("--convergence-boundary-tolerance cannot be negative")
+    if not 0 <= args.convergence_boundary_fraction <= 0.5:
+        raise ValueError("--convergence-boundary-fraction must be between 0 and 0.5")
     if args.convergence_patience < 1:
         raise ValueError("--convergence-patience must be at least 1")
     if args.convergence_min_iterations < 0:
@@ -407,6 +464,9 @@ def run_proposal(
     seed: int,
     grid_size: int,
     posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
     length_scale_x: float | None,
     length_scale_y: float | None,
     n_new: int | None = None,
@@ -446,6 +506,12 @@ def run_proposal(
         str(grid_size),
         "--posterior-samples",
         str(posterior_samples),
+        "--transition-width",
+        format_float(transition_width),
+        "--label-noise",
+        format_float(label_noise),
+        "--contour-fit",
+        contour_fit,
     ]
     if n_new is not None:
         command.extend(["--n-new", str(n_new)])
@@ -509,6 +575,9 @@ def model_preview_config(
     domain: Domain,
     grid_size: int,
     posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
     length_scale_x: float | None,
     length_scale_y: float | None,
 ) -> sweep.ModelConfig:
@@ -521,10 +590,11 @@ def model_preview_config(
     return sweep.ModelConfig(
         mode="monotone-y",
         monotone_direction="decreasing",
+        contour_fit=contour_fit,
         x_scale=domain.rr_scale,
         y_scale=domain.oh_scale,
-        transition_width=0.10,
-        label_noise=0.02,
+        transition_width=transition_width,
+        label_noise=label_noise,
         length_scale_x=length_scale_x or sweep.default_length_scale(
             sweep.transformed_span(
                 model_domain.x_min, model_domain.x_max, domain.rr_scale, "x"
@@ -549,6 +619,9 @@ def build_model_preview_contour(
     points: int,
     grid_size: int,
     posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
     length_scale_x: float | None,
     length_scale_y: float | None,
     seed: int,
@@ -567,7 +640,14 @@ def build_model_preview_contour(
         y_max=domain.oh_max,
     )
     config = model_preview_config(
-        domain, grid_size, posterior_samples, length_scale_x, length_scale_y
+        domain,
+        grid_size,
+        posterior_samples,
+        transition_width,
+        label_noise,
+        contour_fit,
+        length_scale_x,
+        length_scale_y,
     )
     aggregates = sweep.aggregate_observations(observations)
     rng = random.Random(seed)
@@ -652,29 +732,60 @@ def contour_sse(
     domain: Domain,
     mode: str,
 ) -> float | None:
+    metrics = contour_change_metrics(previous, current, domain, mode, 0.12)
+    return None if metrics is None else metrics["sse"]
+
+
+def contour_change_metrics(
+    previous: Sequence[dict[str, float]],
+    current: Sequence[dict[str, float]],
+    domain: Domain,
+    mode: str,
+    boundary_fraction: float,
+) -> dict[str, float] | None:
     if not previous or not current:
         return None
-    total = 0.0
+    deltas: list[float] = []
+    boundary_deltas: list[float] = []
+
+    def add_delta(delta: float, fraction: float) -> None:
+        deltas.append(delta)
+        if fraction <= boundary_fraction or fraction >= 1.0 - boundary_fraction:
+            boundary_deltas.append(delta)
+
     if mode in {"y", "both"}:
-        for before, after in zip(previous, current):
+        points = min(len(previous), len(current))
+        for index, (before, after) in enumerate(zip(previous, current)):
             before_y = before.get("y_c_pred", 0)
             after_y = after.get("y_c_pred", 0)
             if before_y <= 0 or after_y <= 0:
                 continue
             delta = scaled_value(after_y, domain.oh_scale) - scaled_value(before_y, domain.oh_scale)
-            total += delta * delta
+            fraction = index / (points - 1) if points > 1 else 0.5
+            add_delta(delta, fraction)
     if mode in {"x", "both"}:
         points = min(len(previous), len(current))
-        if points < 2:
-            return total
-        for index in range(points):
-            fraction = index / (points - 1)
-            y_value = value_at_fraction(domain.oh_min, domain.oh_max, fraction, domain.oh_scale)
-            before_x = interpolate_contour_x_at_y(previous, y_value, domain)
-            after_x = interpolate_contour_x_at_y(current, y_value, domain)
-            delta = scaled_value(after_x, domain.rr_scale) - scaled_value(before_x, domain.rr_scale)
-            total += delta * delta
-    return total
+        if points >= 2:
+            for index in range(points):
+                fraction = index / (points - 1)
+                y_value = value_at_fraction(domain.oh_min, domain.oh_max, fraction, domain.oh_scale)
+                before_x = interpolate_contour_x_at_y(previous, y_value, domain)
+                after_x = interpolate_contour_x_at_y(current, y_value, domain)
+                delta = scaled_value(after_x, domain.rr_scale) - scaled_value(before_x, domain.rr_scale)
+                add_delta(delta, fraction)
+    if not deltas:
+        return None
+    sse = sum(delta * delta for delta in deltas)
+    rms = math.sqrt(sse / len(deltas))
+    max_delta = max(abs(delta) for delta in deltas)
+    boundary_max = max((abs(delta) for delta in boundary_deltas), default=max_delta)
+    return {
+        "sse": sse,
+        "rms": rms,
+        "max": max_delta,
+        "boundary_max": boundary_max,
+        "points": float(len(deltas)),
+    }
 
 
 def write_state(output_dir: Path, state: dict[str, Any]) -> None:
@@ -1491,6 +1602,9 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                 points=args.preview_points,
                 grid_size=args.preview_grid_size,
                 posterior_samples=args.preview_posterior_samples,
+                transition_width=args.transition_width,
+                label_noise=args.label_noise,
+                contour_fit=args.contour_fit,
                 length_scale_x=args.length_scale_x,
                 length_scale_y=args.length_scale_y,
                 seed=args.seed + 10_000 + iteration,
@@ -1498,30 +1612,59 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             write_preview_contour(preview_path, preview_contour)
             if (
                 args.convergence_sse_tolerance > 0
-                and previous_convergence_contour
+                or args.convergence_rms_tolerance > 0
+                or args.convergence_max_tolerance > 0
+                or args.convergence_boundary_tolerance > 0
+            ) and (
+                previous_convergence_contour
                 and completed_iterations >= args.convergence_min_iterations
             ):
-                sse = contour_sse(
+                metrics = contour_change_metrics(
                     previous_convergence_contour,
                     preview_contour,
                     domain,
                     args.convergence_mode,
+                    args.convergence_boundary_fraction,
                 )
-                if sse is not None and sse <= args.convergence_sse_tolerance:
+                stable = False
+                if metrics is not None:
+                    stable = True
+                    if (
+                        args.convergence_sse_tolerance > 0
+                        and metrics["sse"] > args.convergence_sse_tolerance
+                    ):
+                        stable = False
+                    if (
+                        args.convergence_rms_tolerance > 0
+                        and metrics["rms"] > args.convergence_rms_tolerance
+                    ):
+                        stable = False
+                    if (
+                        args.convergence_max_tolerance > 0
+                        and metrics["max"] > args.convergence_max_tolerance
+                    ):
+                        stable = False
+                    if (
+                        args.convergence_boundary_tolerance > 0
+                        and metrics["boundary_max"] > args.convergence_boundary_tolerance
+                    ):
+                        stable = False
+                if stable:
                     stable_convergence_checks += 1
                 else:
                     stable_convergence_checks = 0
-                if sse is not None:
+                if metrics is not None:
                     messages.append(
-                        "Contour convergence SSE "
-                        f"{sse:.3g} ({stable_convergence_checks}/"
-                        f"{args.convergence_patience})."
+                        "Contour movement "
+                        f"rms={metrics['rms']:.3g}, max={metrics['max']:.3g}, "
+                        f"edge={metrics['boundary_max']:.3g} "
+                        f"({stable_convergence_checks}/{args.convergence_patience})."
                     )
                 if stable_convergence_checks >= args.convergence_patience:
                     stopped_for_convergence = True
                     messages.append(
-                        "Stopped early: learned contour change stayed below "
-                        f"{args.convergence_sse_tolerance:g}."
+                        "Stopped early: learned contour movement stayed below "
+                        "the configured RMS, max, and boundary tolerances."
                     )
                     break
             previous_convergence_contour = list(preview_contour)
@@ -1535,6 +1678,9 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             seed=args.seed + iteration,
             grid_size=args.grid_size,
             posterior_samples=args.posterior_samples,
+            transition_width=args.transition_width,
+            label_noise=args.label_noise,
+            contour_fit=args.contour_fit,
             length_scale_x=args.length_scale_x,
             length_scale_y=args.length_scale_y,
             n_new=args.n_new,
