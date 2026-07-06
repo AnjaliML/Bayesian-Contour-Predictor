@@ -4,12 +4,12 @@
 
 seed = 11
 classifier = binary
-size_tolerance = 0.005
-iterations = 50
-initial_points = 20
-batch_size = 32
+size_tolerance = 0.0099
+iterations = 100
+initial_points = 64
+batch_size = 64
 n_new = auto
-n_repeats = 4
+n_repeats = 0
 
 # Parameter-space bounds from the drop-injection regime map.
 rr_min = 1
@@ -22,9 +22,9 @@ oh_scale = log10
 # Proposal model and display-performance controls.
 # posterior_samples = 0 is the fast interactive visualizer setting.
 # Increase it when uncertainty bands matter more than run speed.
-grid_size = 31
-posterior_samples = 8
-transition_width = 0.04
+grid_size = 42
+posterior_samples = 16
+transition_width = 0.05
 label_noise = 0.005
 contour_fit = adaptive-linear
 length_scale_x = 0.18
