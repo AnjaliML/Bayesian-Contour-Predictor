@@ -69,10 +69,11 @@ likely as `y` increases.
 - `adaptive-linear`: use local-linear fitting near `x` domain edges and
   local-constant fitting elsewhere.
 
-The tuned drop-injection profile uses `local-linear`. A five-family benchmark
-found that the interior local-constant behavior of `adaptive-linear` could
-stabilize with a smoothing bias. `adaptive-linear` remains available when CPU
-time is tighter than contour precision.
+**Preferred default: `local-linear`.** Use it for final or production contour
+estimation. A five-family benchmark found that the interior local-constant
+behavior of `adaptive-linear` could stabilize with a smoothing bias.
+`adaptive-linear` remains available as a speed-first option for exploratory
+previews when CPU time matters more than contour precision.
 
 When completed data at an exact `x` already bracket the transition with both
 `id = 1` and `id = 0`, tight brackets constrain the fitted contour at that
@@ -130,10 +131,38 @@ The monotone acquisition also proposes bracket refinements:
 
 Final new-coordinate selection is stratified across transformed `x` bins, so a
 dense or high-scoring region cannot consume the entire batch. Before that fill,
-the selector hard-reserves both x-domain edges when candidates exist and up to
-half of the batch for exact/local label-bracket bisection. This turns local
-refinement into persistent probabilistic bisection instead of repeatedly
-sampling only the current fitted line.
+the selector hard-reserves both x-domain edges when candidates exist, a
+configurable scarcity quota, and up to half of the batch for exact/local
+label-bracket bisection. This turns local refinement into persistent
+probabilistic bisection instead of repeatedly sampling only the current fitted
+line.
+
+## Scarcity Exploration
+
+Soft gap scores alone can leave an interval untested when bracket or edge
+candidates repeatedly rank higher. The auxiliary scarcity loop therefore:
+
+1. Counts completed runs in equal-width transformed-`x` bins.
+2. Adds randomized anchors inside the least-tested bins and the largest gaps
+   between observed `x` coordinates.
+3. Measures how many nearby points actually test the predicted transition,
+   rather than counting far-away `y` points as sufficient coverage.
+4. Fans randomized probes below, near, and above the predicted contour.
+5. Reserves a fixed fraction of each new-point batch for the best of these
+   candidates and spreads them across sparse `x` bins.
+
+The controls are:
+
+```text
+scarcity_fraction = 0.125
+scarcity_candidate_bins = 12
+scarcity_fan_width = 0.08
+```
+
+With the default batch of eight deterministic simulations, one slot is
+guaranteed for scarcity exploration. Increase `scarcity_fraction` for a
+dedicated coverage campaign, or set it to `0` to disable the auxiliary loop.
+All randomization is reproducible from the proposal `seed`.
 
 ## What "Bayesian" Means Here
 

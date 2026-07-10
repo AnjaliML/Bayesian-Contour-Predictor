@@ -71,6 +71,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "contour_fit": "local-linear",
     "length_scale_x": 0.18,
     "length_scale_y": None,
+    "scarcity_fraction": 0.125,
+    "scarcity_candidate_bins": 12,
+    "scarcity_fan_width": 0.08,
     "preview_points": 101,
     "preview_grid_size": 21,
     "preview_every": 1,
@@ -108,6 +111,9 @@ PARAM_TYPES = {
     "contour_fit": str,
     "length_scale_x": optional_float,
     "length_scale_y": optional_float,
+    "scarcity_fraction": float,
+    "scarcity_candidate_bins": int,
+    "scarcity_fan_width": float,
     "preview_points": int,
     "preview_grid_size": int,
     "preview_every": int,
@@ -256,6 +262,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--length-scale-x", type=optional_float, default=defaults["length_scale_x"])
     parser.add_argument("--length-scale-y", type=optional_float, default=defaults["length_scale_y"])
+    parser.add_argument("--scarcity-fraction", type=float, default=defaults["scarcity_fraction"])
+    parser.add_argument(
+        "--scarcity-candidate-bins",
+        type=int,
+        default=defaults["scarcity_candidate_bins"],
+    )
+    parser.add_argument("--scarcity-fan-width", type=float, default=defaults["scarcity_fan_width"])
     parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
     parser.add_argument("--preview-grid-size", type=int, default=defaults["preview_grid_size"])
     parser.add_argument("--preview-every", type=int, default=defaults["preview_every"])
@@ -375,6 +388,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--length-scale-x must be positive or auto")
     if args.length_scale_y is not None and args.length_scale_y <= 0:
         raise ValueError("--length-scale-y must be positive or auto")
+    if not 0 <= args.scarcity_fraction <= 1:
+        raise ValueError("--scarcity-fraction must be between 0 and 1")
+    if args.scarcity_candidate_bins < 2:
+        raise ValueError("--scarcity-candidate-bins must be at least 2")
+    if not 0 < args.scarcity_fan_width <= 0.5:
+        raise ValueError("--scarcity-fan-width must be in (0, 0.5]")
     if args.preview_points < 2:
         raise ValueError("--preview-points must be at least 2")
     if args.preview_grid_size < 5:
@@ -544,6 +563,9 @@ def run_proposal(
     contour_fit: str,
     length_scale_x: float | None,
     length_scale_y: float | None,
+    scarcity_fraction: float,
+    scarcity_candidate_bins: int,
+    scarcity_fan_width: float,
     n_new: int | None = None,
     n_repeats: int | None = None,
 ) -> list[dict[str, str]]:
@@ -587,6 +609,12 @@ def run_proposal(
         format_float(label_noise),
         "--contour-fit",
         contour_fit,
+        "--scarcity-fraction",
+        format_float(scarcity_fraction),
+        "--scarcity-candidate-bins",
+        str(scarcity_candidate_bins),
+        "--scarcity-fan-width",
+        format_float(scarcity_fan_width),
     ]
     if n_new is not None:
         command.extend(["--n-new", str(n_new)])
@@ -1990,6 +2018,9 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
             contour_fit=args.contour_fit,
             length_scale_x=args.length_scale_x,
             length_scale_y=args.length_scale_y,
+            scarcity_fraction=args.scarcity_fraction,
+            scarcity_candidate_bins=args.scarcity_candidate_bins,
+            scarcity_fan_width=args.scarcity_fan_width,
             n_new=args.n_new,
             n_repeats=args.n_repeats,
         )

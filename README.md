@@ -82,6 +82,15 @@ python3 benchmarks/benchmark_contours.py --output benchmark-results.csv
 Known synthetic contours exist only in this benchmark and are used only after
 each batch to score normalized transformed-space SSE.
 
+Sparse parameter intervals are handled by a configurable auxiliary acquisition
+quota. The default reserves one of every eight new points for a randomized
+anchor in an under-tested transformed-`x` bin, with `y` probes fanned around the
+predicted transition. See `scarcity_*` in [explore.params](explore.params).
+
+For monotone contours, prefer `contour_fit = local-linear` for final results.
+Use `adaptive-linear` only as a faster exploratory setting when its higher
+contour error is acceptable.
+
 ## Tests
 
 ```bash

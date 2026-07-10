@@ -29,6 +29,13 @@ label_noise = 0.005
 contour_fit = local-linear
 length_scale_x = 0.18
 length_scale_y = auto
+
+# Auxiliary exploration: reserve one of the default eight new-point slots for randomized
+# x anchors in sparse regions, with y probes below/near/above the transition.
+scarcity_fraction = 0.125
+scarcity_candidate_bins = 12
+scarcity_fan_width = 0.08
+
 preview_points = 101
 preview_grid_size = 21
 preview_every = 1

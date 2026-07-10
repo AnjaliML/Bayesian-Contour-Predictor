@@ -84,6 +84,9 @@ class ModelConfig:
     prior_beta: float
     grid_size: int
     posterior_samples: int
+    scarcity_fraction: float = 0.125
+    scarcity_candidate_bins: int = 12
+    scarcity_fan_width: float = 0.08
 
 
 @dataclass(frozen=True)
@@ -848,6 +851,19 @@ def x_bin_counts(
     return counts
 
 
+def x_bin_anchor_counts(
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    bin_count: int,
+) -> list[int]:
+    """Count distinct tested x anchors, not repeated simulations."""
+    anchors: list[set[float]] = [set() for _ in range(bin_count)]
+    for point in aggregates:
+        anchors[x_bin_index(point.x, domain, config, bin_count)].add(point.x)
+    return [len(values) for values in anchors]
+
+
 def x_bin_scarcity_score(
     x: float,
     bin_counts: Sequence[int],
@@ -859,6 +875,100 @@ def x_bin_scarcity_score(
     count = bin_counts[x_bin_index(x, domain, config, len(bin_counts))]
     max_count = max(bin_counts) or 1
     return clamp(1.0 - count / max_count, 0.0, 1.0)
+
+
+def scarcity_anchor_x_values(
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    rng: random.Random,
+    count: int,
+) -> list[float]:
+    """Place randomized anchors in the least-tested transformed-x regions."""
+    if count <= 0 or config.scarcity_fraction <= 0:
+        return []
+    bin_count = max(config.scarcity_candidate_bins, 1)
+    counts = x_bin_anchor_counts(aggregates, domain, config, bin_count)
+    lower = transformed_value(domain.x_min, config.x_scale, "x")
+    upper = transformed_value(domain.x_max, config.x_scale, "x")
+    span = max(upper - lower, 1e-12)
+    bin_width = span / bin_count
+
+    candidates: list[tuple[int, float, float]] = []
+    for index, observed_count in enumerate(counts):
+        jitter = rng.uniform(-0.28, 0.28)
+        x_t = lower + (index + 0.5 + jitter) * bin_width
+        x = inverse_transformed_value(clamp(x_t, lower, upper), config.x_scale)
+        candidates.append(
+            (
+                observed_count,
+                -x_gap_score(x, aggregates, domain, config),
+                x,
+            )
+        )
+
+    existing_x = sorted(
+        {
+            transformed_value(point.x, config.x_scale, "x")
+            for point in aggregates
+        }
+    )
+    augmented = [lower, *existing_x, upper]
+    for left, right in zip(augmented, augmented[1:]):
+        if right - left <= span * 1e-9:
+            continue
+        x_t = (left + right) / 2.0
+        x = inverse_transformed_value(x_t, config.x_scale)
+        bin_index = x_bin_index(x, domain, config, bin_count)
+        candidates.append((counts[bin_index], -(right - left) / span, x))
+
+    selected: list[float] = []
+    for _, _, x in sorted(candidates):
+        x_t = transformed_value(x, config.x_scale, "x")
+        if any(
+            abs(x_t - transformed_value(existing, config.x_scale, "x"))
+            <= span * 0.02
+            for existing in selected
+        ):
+            continue
+        selected.append(x)
+        if len(selected) >= count:
+            break
+    return selected
+
+
+def transition_scarcity_score(
+    x: float,
+    contour: ContourEstimate,
+    aggregates: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+) -> float:
+    """Return one when few observations test the local transition region."""
+    x_span = max(
+        transformed_span(domain.x_min, domain.x_max, config.x_scale, "x"),
+        1e-12,
+    )
+    y_span = max(
+        transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"),
+        1e-12,
+    )
+    x_scale = max(x_span / max(config.scarcity_candidate_bins, 1), 1e-12)
+    y_scale = max(config.scarcity_fan_width * y_span, config.transition_width, 1e-12)
+    x_t = transformed_value(x, config.x_scale, "x")
+    y_t = transformed_value(contour.y_c_pred, config.y_scale, "y")
+    effective_count = 0.0
+    for point in aggregates:
+        effective_count += (
+            point.n
+            * normal_weight(
+                x_t - transformed_value(point.x, config.x_scale, "x"), x_scale
+            )
+            * normal_weight(
+                y_t - transformed_value(point.y, config.y_scale, "y"), y_scale
+            )
+        )
+    return math.exp(-effective_count / 4.0)
 
 
 def bracket_midpoint_from_points(
@@ -1077,7 +1187,7 @@ def select_adaptive_proposals(
     config: ModelConfig,
     count: int,
 ) -> list[Proposal]:
-    """Reserve batch capacity for exact brackets and both x-domain edges."""
+    """Reserve batch capacity for edges, scarcity probes, and exact brackets."""
     if count <= 0:
         return []
 
@@ -1103,6 +1213,39 @@ def select_adaptive_proposals(
             selected.append(candidate)
         if len(selected) >= count:
             return selected
+
+    scarcity_quota = (
+        min(count, max(1, math.ceil(count * config.scarcity_fraction)))
+        if config.scarcity_fraction > 0
+        else 0
+    )
+    scarcity_candidates = [
+        item for item in ordered if "scarcity transition fan" in item.reason
+    ]
+    scarcity_bins: set[int] = set()
+    for prefer_new_bin in (True, False):
+        for candidate in scarcity_candidates:
+            if candidate in selected:
+                continue
+            candidate_bin = x_bin_index(
+                candidate.x,
+                domain,
+                config,
+                max(config.scarcity_candidate_bins, 1),
+            )
+            if prefer_new_bin and candidate_bin in scarcity_bins:
+                continue
+            if far_enough_from_selected(candidate, selected, domain, config):
+                selected.append(candidate)
+                scarcity_bins.add(candidate_bin)
+            if len(selected) >= count or sum(
+                "scarcity transition fan" in item.reason for item in selected
+            ) >= scarcity_quota:
+                break
+        if len(selected) >= count or sum(
+            "scarcity transition fan" in item.reason for item in selected
+        ) >= scarcity_quota:
+            break
 
     bracket_quota = max(1, count // 2)
     for candidate in ordered:
@@ -1347,6 +1490,54 @@ def y_probe_values_near_contour(
     return probes
 
 
+def randomized_scarcity_fan(
+    contour: ContourEstimate,
+    domain: Domain,
+    config: ModelConfig,
+    rng: random.Random,
+) -> list[tuple[float, float]]:
+    """Fan randomized probes below, near, and above a sparse transition."""
+    center_t = transformed_value(contour.y_c_pred, config.y_scale, "y")
+    lower_t = transformed_value(domain.y_min, config.y_scale, "y")
+    upper_t = transformed_value(domain.y_max, config.y_scale, "y")
+    span_t = max(upper_t - lower_t, 1e-12)
+    q05_t = transformed_value(
+        clamp(contour.y_c_q05, domain.y_min, domain.y_max), config.y_scale, "y"
+    )
+    q95_t = transformed_value(
+        clamp(contour.y_c_q95, domain.y_min, domain.y_max), config.y_scale, "y"
+    )
+    spread_t = max(
+        config.scarcity_fan_width * span_t,
+        abs(q95_t - q05_t) / 2.0,
+        0.025 * span_t,
+    )
+    offsets = [
+        -rng.uniform(0.45, 1.0) * spread_t,
+        rng.uniform(-0.20, 0.20) * spread_t,
+        rng.uniform(0.45, 1.0) * spread_t,
+    ]
+    probes: list[tuple[float, float]] = []
+    seen: list[float] = []
+    for offset in offsets:
+        y_t = clamp(center_t + offset, lower_t, upper_t)
+        if any(abs(y_t - existing) <= span_t * 1e-9 for existing in seen):
+            continue
+        seen.append(y_t)
+        probes.append(
+            (
+                inverse_transformed_value(y_t, config.y_scale),
+                clamp(
+                    abs(offset)
+                    / max(config.scarcity_fan_width * span_t, 1e-12),
+                    0.0,
+                    1.0,
+                ),
+            )
+        )
+    return probes
+
+
 def y_offsets_near_contour(
     contour: ContourEstimate, domain: Domain, config: ModelConfig
 ) -> list[float]:
@@ -1443,11 +1634,11 @@ def propose_new_points(
     proposals: list[Proposal] = []
     x_values = candidate_x_values(domain, aggregates, config, max(config.grid_size, count * 4))
     contour_cache: dict[float, ContourEstimate] = {}
-    scarcity_bins = x_bin_counts(
+    scarcity_bins = x_bin_anchor_counts(
         aggregates,
         domain,
         config,
-        max(1, min(max(count, 4), 12)),
+        max(config.scarcity_candidate_bins, 1),
     )
 
     def contour_for(x: float) -> ContourEstimate:
@@ -1491,7 +1682,13 @@ def propose_new_points(
         )
         inverse_locator = 1.0 if source == "x-from-y locator" else 0.0
         bracket_midpoint = 1.0 if "bracket" in source else 0.0
+        scarcity_probe = 1.0 if source == "scarcity transition fan" else 0.0
         x_scarcity = x_bin_scarcity_score(x, scarcity_bins, domain, config)
+        transition_scarcity = (
+            transition_scarcity_score(x, contour, aggregates, domain, config)
+            if scarcity_probe
+            else 0.0
+        )
         score = (
             0.24 * near_contour
             + 0.18 * contour_uncertainty
@@ -1504,6 +1701,8 @@ def propose_new_points(
             + 0.25 * bracket_midpoint
             + 0.15 * bracket_gap
             + 0.10 * x_scarcity
+            + 0.22 * scarcity_probe * transition_scarcity
+            + 0.12 * scarcity_probe * adaptive_vertical_probe
         )
         reasons = ["new coordinate near predicted contour"]
         if source == "edge bracket expansion":
@@ -1512,6 +1711,8 @@ def propose_new_points(
             reasons.append("bisects observed label bracket")
         if source == "x-from-y locator":
             reasons.append("adaptive x-from-y locator")
+        if source == "scarcity transition fan":
+            reasons.append("scarcity transition fan")
         if gap >= 0.25:
             reasons.append("large gap in sampled x values")
         if x_scarcity >= 0.5:
@@ -1553,6 +1754,29 @@ def propose_new_points(
             vertical_probe=gap_fraction,
             bracket_gap=gap_fraction,
         )
+
+    scarcity_quota = (
+        max(1, math.ceil(count * config.scarcity_fraction))
+        if config.scarcity_fraction > 0
+        else 0
+    )
+    scarcity_pool_size = min(
+        max(config.scarcity_candidate_bins, 1),
+        max(4, scarcity_quota * 4),
+    )
+    for x in scarcity_anchor_x_values(
+        aggregates, domain, config, rng, scarcity_pool_size
+    ):
+        contour = contour_for(x)
+        for y, vertical_probe in randomized_scarcity_fan(
+            contour, domain, config, rng
+        ):
+            add_candidate(
+                x,
+                y,
+                source="scarcity transition fan",
+                vertical_probe=vertical_probe,
+            )
 
     for x in x_values:
         bracket = local_bracket_midpoint_candidate(x, aggregates, domain, config)
@@ -1732,8 +1956,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--contour-fit",
         choices=["local-constant", "local-linear", "adaptive-linear"],
-        default="adaptive-linear",
-        help="Local contour model used when --mode monotone-y is selected.",
+        default="local-linear",
+        help="Local contour model for --mode monotone-y; local-linear is preferred for precision.",
     )
     parser.add_argument(
         "--monotone-direction",
@@ -1751,6 +1975,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-beta", type=float, default=1.0)
     parser.add_argument("--grid-size", type=int, default=41)
     parser.add_argument("--posterior-samples", type=int, default=80)
+    parser.add_argument(
+        "--scarcity-fraction",
+        type=float,
+        default=0.125,
+        help="Fraction of new-point slots reserved for sparse transition regions; 0 disables.",
+    )
+    parser.add_argument(
+        "--scarcity-candidate-bins",
+        type=int,
+        default=12,
+        help="Number of transformed-x density bins used to find under-tested regions.",
+    )
+    parser.add_argument(
+        "--scarcity-fan-width",
+        type=float,
+        default=0.08,
+        help="Random transition-fan half-width as a fraction of transformed y span.",
+    )
     parser.add_argument("--legacy-columns-only", action="store_true")
     return parser
 
@@ -1766,6 +2008,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--grid-size must be at least 5")
     if args.posterior_samples < 0:
         raise ValueError("--posterior-samples cannot be negative")
+    if not 0 <= args.scarcity_fraction <= 1:
+        raise ValueError("--scarcity-fraction must be between 0 and 1")
+    if args.scarcity_candidate_bins < 2:
+        raise ValueError("--scarcity-candidate-bins must be at least 2")
+    if not 0 < args.scarcity_fan_width <= 0.5:
+        raise ValueError("--scarcity-fan-width must be in (0, 0.5]")
 
 
 def validate_domain_scales(domain: Domain, args: argparse.Namespace) -> None:
@@ -1813,6 +2061,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             prior_beta=args.prior_beta,
             grid_size=args.grid_size,
             posterior_samples=args.posterior_samples,
+            scarcity_fraction=args.scarcity_fraction,
+            scarcity_candidate_bins=args.scarcity_candidate_bins,
+            scarcity_fan_width=args.scarcity_fan_width,
         )
         proposals = propose_next_batch(
             observations,

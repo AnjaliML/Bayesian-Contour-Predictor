@@ -38,6 +38,9 @@ MODEL_ARGS=(
   --transition-width 0.04
   --label-noise 0.005
   --length-scale-x 0.18
+  --scarcity-fraction 0.125
+  --scarcity-candidate-bins 12
+  --scarcity-fan-width 0.08
 )
 
 last_completed="$(python3 -c 'import glob,re,sys; values=[int(m.group(1)) for p in glob.glob(sys.argv[1] + "/completed/Sweep-*_completed.csv") if (m := re.search(r"Sweep-(\d+)_completed\.csv$", p))]; print(max(values, default=0))' "${CAMPAIGN_DIR}")"

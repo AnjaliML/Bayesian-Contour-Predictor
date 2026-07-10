@@ -82,7 +82,10 @@ do not change which experiments are proposed.
 The tuned profile uses `length_scale_x = 0.18` and `contour_fit = local-linear`.
 The acquisition reserves candidates at both x edges and up to half of each
 batch for persistent bracket bisection before filling remaining slots across
-transformed x strata.
+transformed x strata. It also reserves one of the default eight slots for a
+randomized scarcity probe in an under-tested transformed-x region, fanned
+around the predicted transition. For a targeted coverage pass, temporarily
+increase `scarcity_fraction`; setting it to `0` restores bracket-only behavior.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.

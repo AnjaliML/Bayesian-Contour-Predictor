@@ -188,6 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-beta", type=float, default=1.0)
     parser.add_argument("--grid-size", type=int, default=21)
     parser.add_argument("--posterior-samples", type=int, default=0)
+    parser.add_argument("--scarcity-fraction", type=float, default=0.125)
+    parser.add_argument("--scarcity-candidate-bins", type=int, default=12)
+    parser.add_argument("--scarcity-fan-width", type=float, default=0.08)
     parser.add_argument("--contour-points", type=int, default=101)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--boundary-fraction", type=float, default=0.12)
@@ -215,6 +218,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--length-scale-x must be positive")
     if args.length_scale_y is not None and args.length_scale_y <= 0:
         raise ValueError("--length-scale-y must be positive")
+    if not 0 <= args.scarcity_fraction <= 1:
+        raise ValueError("--scarcity-fraction must be between 0 and 1")
+    if args.scarcity_candidate_bins < 2:
+        raise ValueError("--scarcity-candidate-bins must be at least 2")
+    if not 0 < args.scarcity_fan_width <= 0.5:
+        raise ValueError("--scarcity-fan-width must be in (0, 0.5]")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -261,6 +270,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             prior_beta=args.prior_beta,
             grid_size=args.grid_size,
             posterior_samples=args.posterior_samples,
+            scarcity_fraction=args.scarcity_fraction,
+            scarcity_candidate_bins=args.scarcity_candidate_bins,
+            scarcity_fan_width=args.scarcity_fan_width,
         )
         config_payload = {
             "mode": config.mode,
@@ -274,6 +286,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "length_scale_y": config.length_scale_y,
             "grid_size": config.grid_size,
             "posterior_samples": config.posterior_samples,
+            "scarcity_fraction": config.scarcity_fraction,
+            "scarcity_candidate_bins": config.scarcity_candidate_bins,
+            "scarcity_fan_width": config.scarcity_fan_width,
             "contour_points": args.contour_points,
         }
         previous: dict[str, Any] = {}

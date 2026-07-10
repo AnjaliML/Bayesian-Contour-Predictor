@@ -38,6 +38,15 @@ edge-only SSE on that family, but local-linear matched total precision about
 `6.5x` faster. These are directional single-seed timings, not universal
 performance claims.
 
+Adding the scarcity auxiliary loop at `scarcity_fraction = 0.125` reduced the
+five-family median final SSE from `0.02783` to `0.02730`, median edge SSE from
+`0.01093` to `0.00536`, and median error-versus-budget AUC from `0.17567` to
+`0.13648` in the same directional screening setup. On the built-in holdout,
+the final SSE changed from `0.02783` to `0.03058`, while edge SSE improved from
+`0.01093` to `0.00715`. A `0.25` quota improved early coverage more aggressively
+but displaced too many bracket points for an eight-point batch, so `0.125` is
+the selected default.
+
 The selected starting profile is therefore:
 
 ```text
@@ -47,6 +56,9 @@ posterior_samples = 0
 transition_width = 0.04
 label_noise = 0.005
 length_scale_x = 0.18
+scarcity_fraction = 0.125
+scarcity_candidate_bins = 12
+scarcity_fan_width = 0.08
 ```
 
 Use the `balanced` profile when approximate uncertainty during acquisition is

@@ -645,6 +645,95 @@ class ProposeNextSweepTests(unittest.TestCase):
 
         self.assertTrue(any(abs(value - 10.0) < 1e-9 for value in candidates))
 
+    def test_scarcity_anchors_find_empty_log_x_region(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            contour_fit="local-linear",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.04,
+            label_noise=0.005,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=21,
+            posterior_samples=0,
+            scarcity_fraction=0.25,
+            scarcity_candidate_bins=12,
+            scarcity_fan_width=0.08,
+        )
+        aggregates = []
+        for index in range(12):
+            x = 10 ** (2.0 * (index + 0.5) / 12.0)
+            if 2.0 < x < 6.0:
+                continue
+            aggregates.append(sweep.AggregatePoint(x=x, y=0.02, n=4, k=2))
+
+        anchors = sweep.scarcity_anchor_x_values(
+            aggregates, domain, config, random.Random(17), 8
+        )
+
+        self.assertTrue(any(2.0 < x < 6.0 for x in anchors))
+
+    def test_batch_reserves_randomized_transition_fans_in_sparse_x_regions(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            contour_fit="local-linear",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.04,
+            label_noise=0.005,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=21,
+            posterior_samples=0,
+            scarcity_fraction=0.25,
+            scarcity_candidate_bins=12,
+            scarcity_fan_width=0.08,
+        )
+        observations = []
+        for index in range(12):
+            x = 10 ** (2.0 * (index + 0.5) / 12.0)
+            if 2.0 < x < 6.0:
+                continue
+            observations.extend(
+                [
+                    sweep.Observation(str(len(observations) + 1), x, 0.018, 1),
+                    sweep.Observation(str(len(observations) + 2), x, 0.038, 0),
+                ]
+            )
+
+        proposals = sweep.propose_next_batch(
+            observations,
+            domain=domain,
+            config=config,
+            n_simulations=8,
+            n_new=8,
+            n_repeats=0,
+            seed=17,
+        )
+        scarcity = [
+            item for item in proposals if "scarcity transition fan" in item.reason
+        ]
+
+        self.assertGreaterEqual(len(scarcity), 2)
+        self.assertTrue(any(2.0 < item.x < 6.0 for item in scarcity))
+        self.assertTrue(
+            any(
+                abs(math.log10(item.y) - math.log10(item.contour.y_c_pred))
+                / math.log10(domain.y_max / domain.y_min)
+                >= 0.03
+                for item in scarcity
+            )
+        )
+
     def test_candidate_x_midpoints_are_bounded_for_long_campaigns(self):
         domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
         aggregates = [
