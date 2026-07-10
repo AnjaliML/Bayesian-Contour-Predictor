@@ -22,6 +22,13 @@ p = (alpha + weighted positives) / (alpha + beta + weighted trials)
 For each candidate `x`, the script scans `y` values and chooses the point where
 the predicted probability is closest to `0.5`.
 
+Generic mode still represents the result as one `y_c(x)` value. It cannot
+certify disconnected or multi-valued contours, and a region with no observed
+`p = 0.5` crossing remains unresolved. For that reason, the bracket-based
+automatic convergence gate is enabled only for `--mode monotone-y`; generic
+campaigns require a geometry-aware contour representation before they should
+stop automatically.
+
 ## Monotone-Y Mode
 
 `--mode monotone-y` is for domains where the probability of `id = 1` changes
@@ -62,9 +69,10 @@ likely as `y` increases.
 - `adaptive-linear`: use local-linear fitting near `x` domain edges and
   local-constant fitting elsewhere.
 
-The default is `adaptive-linear`, which keeps the process-agnostic model but
-reduces one-sided boundary bias without paying the full local-linear cost at
-every interior candidate.
+The tuned drop-injection profile uses `local-linear`. A five-family benchmark
+found that the interior local-constant behavior of `adaptive-linear` could
+stabilize with a smoothing bias. `adaptive-linear` remains available when CPU
+time is tighter than contour precision.
 
 When completed data at an exact `x` already bracket the transition with both
 `id = 1` and `id = 0`, tight brackets constrain the fitted contour at that
@@ -121,4 +129,32 @@ The monotone acquisition also proposes bracket refinements:
 - edge bracket expansion when a domain edge has only one observed label so far.
 
 Final new-coordinate selection is stratified across transformed `x` bins, so a
-dense or high-scoring region cannot consume the entire batch.
+dense or high-scoring region cannot consume the entire batch. Before that fill,
+the selector hard-reserves both x-domain edges when candidates exist and up to
+half of the batch for exact/local label-bracket bisection. This turns local
+refinement into persistent probabilistic bisection instead of repeatedly
+sampling only the current fitted line.
+
+## What "Bayesian" Means Here
+
+This is not a neural network and not a fully joint Bayesian contour posterior.
+It is a dependency-light local kernel/logistic boundary model with
+Beta/Bernoulli aggregation and posterior-rate resampling. For a more
+sophisticated next model, Gaussian-process classification with level-set or
+straddle acquisition is the natural first comparison for expensive 2-D
+simulations. Neural networks are usually a worse low-data default.
+
+## Offline SSE Benchmark
+
+`benchmarks/benchmark_contours.py` freezes several contour families. The
+proposal engine sees only simulated `x,y,id`; the known boundary is called only
+after a completed batch to compute:
+
+```text
+SSE = sum(((T_y(y_pred) - T_y(y_true)) / transformed_y_span)^2)
+```
+
+It also reports RMSE, edge SSE, maximum error, error-versus-budget AUC, and wall
+time. The repository's binary and size-based examples share the same boundary
+shape up to a constant scale, so they are treated as one family rather than two
+independent validation cases.

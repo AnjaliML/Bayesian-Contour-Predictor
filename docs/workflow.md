@@ -48,9 +48,9 @@ Useful options:
 
 ```bash
 python3 end-to-end-with-visualization-drop-injection.py \
-  --iterations 120 \
-  --batch-size 16 \
-  --n-repeats 3 \
+  --iterations 20 \
+  --batch-size 8 \
+  --n-repeats 0 \
   --delay 0.04 \
   --seed 22
 ```
@@ -59,19 +59,16 @@ python3 end-to-end-with-visualization-drop-injection.py \
 `--delay` for a slower presentation run, or set `--delay 0` for a fast
 batch-style run that still writes the final visualization artifacts.
 
-For long runs, contour previews are refreshed every `preview_every` sweeps by
-default. This avoids the slowdown caused by recomputing a dense display-only
-contour on every iteration as the campaign grows.
+The tuned example refreshes on every completed batch so convergence checks are
+meaningful. A mandatory final refresh includes the final experimental batch.
 
-Each visualizer sweep runs `batch_size` simulations. With the default
-`batch_size = 16` and `n_repeats = 3`, the proposal engine chooses 13 new
-coordinates and 3 repeat coordinates. Set `n_new` and `n_repeats` in
-`explore.params` to pin that split, or leave them as `auto` to let
-`propose_next_sweep.py` choose.
+Each visualizer sweep runs `batch_size` simulations. The deterministic example
+uses eight new coordinates and no repeats. For a stochastic simulator, reserve
+roughly 10--20 percent of the batch for repeats near disputed labels.
 
 The campaign has no hard cap on completed data points: total completed runs are
-`initial_points + iterations * batch_size`. For example, 120 sweeps at the
-default settings gives 1,940 completed runs, while 600 sweeps would give 9,620.
+`initial_points + iterations * batch_size`. The tuned maximum is 184 runs
+before an earlier convergence stop.
 For speed, repeat scoring preselects about 50 informative existing coordinates
 once the dataset is larger than that; model fitting and new-point scoring still
 use the completed observations.
@@ -82,13 +79,10 @@ interactive animation. Increase `posterior_samples` and
 `preview_points` and `preview_grid_size` only affect the displayed contour; they
 do not change which experiments are proposed.
 
-Near a lower log-scale boundary such as `x = 1`, prefer more points per sweep
-or a denser display preview before jumping straight to hundreds of sweeps. A
-typical refinement run is the default `--iterations 120 --batch-size 16 --n-repeats 3`,
-which spends most of the extra budget on new coordinates while keeping a few
-noise-check repeats. The visualizer also sets `length_scale_x = 0.18` by default,
-uses `contour_fit = adaptive-linear`, and adds explicit edge bracket probes to
-reduce over-smoothing near log-scale boundaries.
+The tuned profile uses `length_scale_x = 0.18` and `contour_fit = local-linear`.
+The acquisition reserves candidates at both x edges and up to half of each
+batch for persistent bracket bisection before filling remaining slots across
+transformed x strata.
 
 The generated CSV files, `state.json`, and `index.html` are written under
 `visualization_runs/` by default.
@@ -130,9 +124,34 @@ Common stopping checks:
 - New proposed points stop moving the inferred contour.
 - The contour resolution is fine enough for the downstream paper or design use.
 
-The visualizer can stop automatically before `iterations` is exhausted. It
-compares consecutive learned contours on the preview grid and stops when RMS
-movement, maximum pointwise movement, and edge-region movement stay below their
-configured tolerances for `convergence_patience` checks after
-`convergence_min_iterations` sweeps. `convergence_mode` can compare `y`,
-inverse `x`, or `both` views of the contour.
+The visualizer and generic assessor do not stop on movement alone. They require
+small RMS, maximum, and edge movement plus narrow observed y brackets, bounded
+gaps between bracketed x anchors, and brackets at both x-domain edges. A stable
+line without those resolution gates is `stalled`, not converged.
+
+## Rearmable External-Simulator Loop
+
+Copy [../examples/rearm_campaign.sh](../examples/rearm_campaign.sh). Put an
+initial `caseId,x,y,id` file at
+`campaign/completed/Sweep-0_completed.csv`, then run:
+
+```bash
+BATCH_RUNNER=/path/to/run_batch.sh \
+CAMPAIGN_DIR=campaign \
+bash examples/rearm_campaign.sh
+```
+
+The adapter contract is:
+
+```text
+run_batch.sh INPUT_PROPOSALS.csv OUTPUT_COMPLETED.csv
+```
+
+The adapter owns scheduler and process-specific details. It must preserve
+`caseId,x,y` and replace every `id = -1` with `0` or `1`. The loop is durable:
+it keeps completed batches, contour snapshots, and `state.json`; on `stalled`
+it exits so a human or agent can adjust parameters and rearm it.
+
+`assess_contour.py` reports consecutive-contour SSE because that is useful for
+auditing, but stops on RMSE so the threshold is invariant to contour-grid size.
+It never imports a theoretical boundary.

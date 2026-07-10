@@ -503,6 +503,67 @@ class ProposeNextSweepTests(unittest.TestCase):
 
         self.assertAlmostEqual(estimate, math.sqrt(0.00449 * 0.00451))
 
+    def test_exact_bracket_does_not_collapse_posterior_uncertainty(self):
+        domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
+        aggregates = [
+            sweep.AggregatePoint(x=10.0, y=0.01, n=1, k=1),
+            sweep.AggregatePoint(x=10.0, y=0.02, n=1, k=0),
+        ]
+        config = sweep.ModelConfig(
+            mode="monotone-y",
+            monotone_direction="decreasing",
+            contour_fit="local-linear",
+            x_scale="log10",
+            y_scale="log10",
+            transition_width=0.04,
+            label_noise=0.005,
+            length_scale_x=0.18,
+            length_scale_y=0.4,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=15,
+            posterior_samples=40,
+        )
+
+        estimate = sweep.contour_estimate(
+            10.0, aggregates, domain, config, random.Random(7)
+        )
+
+        self.assertGreater(estimate.y_c_q95, estimate.y_c_q05)
+        self.assertGreater(estimate.y_c_std, 0.0)
+
+    def test_repeat_only_batch_is_filled_to_requested_size(self):
+        domain = sweep.Domain(x_min=0.0, x_max=1.0, y_min=0.0, y_max=1.0)
+        observations = [sweep.Observation("1", 0.5, 0.5, 1)]
+        config = sweep.ModelConfig(
+            mode="generic",
+            monotone_direction="decreasing",
+            contour_fit="local-constant",
+            x_scale="linear",
+            y_scale="linear",
+            transition_width=0.1,
+            label_noise=0.02,
+            length_scale_x=0.2,
+            length_scale_y=0.2,
+            prior_alpha=1.0,
+            prior_beta=1.0,
+            grid_size=5,
+            posterior_samples=0,
+        )
+
+        proposals = sweep.propose_next_batch(
+            observations,
+            domain=domain,
+            config=config,
+            n_simulations=8,
+            n_new=0,
+            n_repeats=8,
+            seed=3,
+        )
+
+        self.assertEqual(len(proposals), 8)
+        self.assertTrue(all(item.proposal_type == "repeat" for item in proposals))
+
     def test_stratified_selection_keeps_multiple_x_regions(self):
         domain = sweep.Domain(x_min=1.0, x_max=100.0, y_min=0.001, y_max=0.1)
         config = sweep.ModelConfig(

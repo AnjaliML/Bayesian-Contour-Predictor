@@ -21,6 +21,7 @@ from typing import Any, Sequence
 
 from classify_drops import oh_c as binary_oh_c
 from classify_drops_sized_based import DEFAULT_SIZE_TOLERANCE, size_threshold_y
+import assess_contour as assessment
 import propose_next_sweep as sweep
 
 
@@ -49,11 +50,11 @@ def optional_float(value: str) -> float | None:
 
 
 DEFAULT_PARAMS: dict[str, Any] = {
-    "iterations": 120,
-    "initial_points": 20,
-    "batch_size": 16,
+    "iterations": 20,
+    "initial_points": 24,
+    "batch_size": 8,
     "n_new": None,
-    "n_repeats": 3,
+    "n_repeats": 0,
     "seed": 11,
     "classifier": "binary",
     "size_tolerance": DEFAULT_SIZE_TOLERANCE,
@@ -63,23 +64,25 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "oh_min": 0.001,
     "oh_max": 0.1,
     "oh_scale": "log10",
-    "grid_size": 15,
+    "grid_size": 21,
     "posterior_samples": 0,
     "transition_width": 0.04,
     "label_noise": 0.005,
-    "contour_fit": "adaptive-linear",
+    "contour_fit": "local-linear",
     "length_scale_x": 0.18,
     "length_scale_y": None,
-    "preview_points": 120,
-    "preview_grid_size": 61,
-    "preview_every": 10,
+    "preview_points": 101,
+    "preview_grid_size": 21,
+    "preview_every": 1,
     "preview_posterior_samples": 0,
     "convergence_rms_tolerance": 0.0015,
     "convergence_max_tolerance": 0.008,
     "convergence_boundary_tolerance": 0.004,
     "convergence_boundary_fraction": 0.12,
+    "convergence_max_x_gap": 0.15,
+    "convergence_max_y_bracket_width": 0.03,
     "convergence_patience": 3,
-    "convergence_min_iterations": 30,
+    "convergence_min_iterations": 5,
     "convergence_mode": "both",
     "delay": 0.04,
 }
@@ -113,6 +116,8 @@ PARAM_TYPES = {
     "convergence_max_tolerance": float,
     "convergence_boundary_tolerance": float,
     "convergence_boundary_fraction": float,
+    "convergence_max_x_gap": float,
+    "convergence_max_y_bracket_width": float,
     "convergence_patience": int,
     "convergence_min_iterations": int,
     "convergence_mode": str,
@@ -290,6 +295,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of consecutive convergence checks required before stopping.",
     )
     parser.add_argument(
+        "--convergence-max-x-gap",
+        type=float,
+        default=defaults["convergence_max_x_gap"],
+        help="Require bracketed x anchors to leave no larger normalized x gap.",
+    )
+    parser.add_argument(
+        "--convergence-max-y-bracket-width",
+        type=float,
+        default=defaults["convergence_max_y_bracket_width"],
+        help="Require every observed y bracket to be this narrow in transformed space.",
+    )
+    parser.add_argument(
+        "--convergence-allow-unbracketed-edges",
+        action="store_true",
+        help="Allow convergence without exact brackets at both x edges.",
+    )
+    parser.add_argument(
         "--convergence-min-iterations",
         type=int,
         default=defaults["convergence_min_iterations"],
@@ -369,6 +391,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--convergence-boundary-tolerance cannot be negative")
     if not 0 <= args.convergence_boundary_fraction <= 0.5:
         raise ValueError("--convergence-boundary-fraction must be between 0 and 0.5")
+    if not 0 < args.convergence_max_x_gap <= 1:
+        raise ValueError("--convergence-max-x-gap must be in (0, 1]")
+    if not 0 < args.convergence_max_y_bracket_width <= 1:
+        raise ValueError("--convergence-max-y-bracket-width must be in (0, 1]")
     if args.convergence_patience < 1:
         raise ValueError("--convergence-patience must be at least 1")
     if args.convergence_min_iterations < 0:
@@ -1851,9 +1877,45 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                     args.convergence_mode,
                     args.convergence_boundary_fraction,
                 )
+                observations, _ = sweep.read_csv_files(
+                    completed_files,
+                    case_col="caseId",
+                    x_col="Rr",
+                    y_col="Oh",
+                    label_col="id",
+                )
+                model_domain = sweep.Domain(
+                    x_min=domain.rr_min,
+                    x_max=domain.rr_max,
+                    y_min=domain.oh_min,
+                    y_max=domain.oh_max,
+                )
+                resolution = assessment.contour_resolution(
+                    sweep.aggregate_observations(observations),
+                    model_domain,
+                    model_preview_config(
+                        domain,
+                        args.preview_grid_size,
+                        0,
+                        args.transition_width,
+                        args.label_noise,
+                        args.contour_fit,
+                        args.length_scale_x,
+                        args.length_scale_y,
+                    ),
+                )
+                resolution_ready = bool(
+                    resolution["max_x_gap"] <= args.convergence_max_x_gap
+                    and resolution["max_y_bracket_width"]
+                    <= args.convergence_max_y_bracket_width
+                    and (
+                        args.convergence_allow_unbracketed_edges
+                        or all(resolution["edge_bracketed"].values())
+                    )
+                )
                 stable = False
                 if metrics is not None:
-                    stable = True
+                    stable = resolution_ready
                     if (
                         args.convergence_rms_tolerance > 0
                         and metrics["rms"] > args.convergence_rms_tolerance
@@ -1879,6 +1941,8 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
                         "Contour movement "
                         f"rms={metrics['rms']:.3g}, max={metrics['max']:.3g}, "
                         f"edge={metrics['boundary_max']:.3g} "
+                        f"x-gap={resolution['max_x_gap']:.3g}, "
+                        f"y-bracket={resolution['max_y_bracket_width']:.3g} "
                         f"({stable_convergence_checks}/{args.convergence_patience}).",
                     )
                 if stable_convergence_checks >= args.convergence_patience:
@@ -2057,6 +2121,28 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         completed_iterations = iteration
         sleep_if_requested(args.delay)
 
+    # Always rebuild after the last completed batch. Pre-sweep previews are
+    # intentionally cheap, but reusing one here would omit the campaign's
+    # final observations from the reported contour.
+    preview_contour = build_model_preview_contour(
+        completed_files,
+        domain,
+        points=args.preview_points,
+        grid_size=args.preview_grid_size,
+        posterior_samples=args.preview_posterior_samples,
+        transition_width=args.transition_width,
+        label_noise=args.label_noise,
+        contour_fit=args.contour_fit,
+        length_scale_x=args.length_scale_x,
+        length_scale_y=args.length_scale_y,
+        seed=args.seed + 20_000 + completed_iterations,
+    )
+    write_preview_contour(
+        output_dir / f"Sweep-{completed_iterations}_contour-final.csv",
+        preview_contour,
+    )
+    log_progress(messages, "Refreshed the final contour from all completed runs.")
+
     log_progress(
         messages,
         (
@@ -2074,7 +2160,7 @@ def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
         domain=domain,
         completed=all_completed,
         proposals=[],
-        contour=preview_contour if args.iterations else [],
+        contour=preview_contour,
         true_contour=true_contour,
         history=history,
         messages=messages,

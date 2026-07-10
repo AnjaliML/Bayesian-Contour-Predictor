@@ -604,7 +604,12 @@ def estimate_monotone_y_c(
         for point in aggregates
         if abs(transformed_x(point.x, config) - transformed_x(x, config)) <= 1e-12
     ]
-    exact_bracket = bracket_midpoint_from_points(exact_points, domain, config)
+    exact_bracket = bracket_midpoint_from_points(
+        exact_points,
+        domain,
+        config,
+        sampled_rates=sampled_rates,
+    )
     if exact_bracket is not None:
         y, gap_fraction = exact_bracket
         if gap_fraction <= 0.20:
@@ -674,10 +679,17 @@ def quantile(values: Sequence[float], probability: float) -> float:
 
 
 def sample_rates(
-    aggregates: Sequence[AggregatePoint], rng: random.Random
+    aggregates: Sequence[AggregatePoint],
+    rng: random.Random,
+    *,
+    prior_alpha: float = 1.0,
+    prior_beta: float = 1.0,
 ) -> dict[tuple[float, float], float]:
     return {
-        (point.x, point.y): rng.betavariate(point.k + 1.0, point.n - point.k + 1.0)
+        (point.x, point.y): rng.betavariate(
+            point.k + prior_alpha,
+            point.n - point.k + prior_beta,
+        )
         for point in aggregates
     }
 
@@ -696,7 +708,12 @@ def contour_estimate(
             aggregates,
             domain,
             config,
-            sampled_rates=sample_rates(aggregates, rng),
+            sampled_rates=sample_rates(
+                aggregates,
+                rng,
+                prior_alpha=config.prior_alpha,
+                prior_beta=config.prior_beta,
+            ),
         )
         for _ in range(max(config.posterior_samples, 0))
     ]
@@ -845,15 +862,20 @@ def x_bin_scarcity_score(
 
 
 def bracket_midpoint_from_points(
-    points: Sequence[AggregatePoint], domain: Domain, config: ModelConfig
+    points: Sequence[AggregatePoint],
+    domain: Domain,
+    config: ModelConfig,
+    *,
+    sampled_rates: dict[tuple[float, float], float] | None = None,
 ) -> tuple[float, float] | None:
     y_span = max(transformed_span(domain.y_min, domain.y_max, config.y_scale, "y"), 1e-12)
     positives: list[float] = []
     negatives: list[float] = []
     for point in points:
-        if point.rate > 0.5:
+        rate = sampled_rates[(point.x, point.y)] if sampled_rates else point.rate
+        if rate > 0.5:
             positives.append(transformed_y(point.y, config.y_scale))
-        elif point.rate < 0.5:
+        elif rate < 0.5:
             negatives.append(transformed_y(point.y, config.y_scale))
     if not positives or not negatives:
         return None
@@ -1002,6 +1024,8 @@ def select_stratified_proposals(
     domain: Domain,
     config: ModelConfig,
     count: int,
+    *,
+    initial: Sequence[Proposal] = (),
 ) -> list[Proposal]:
     if count <= 0:
         return []
@@ -1012,7 +1036,7 @@ def select_stratified_proposals(
     for group in grouped.values():
         group.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
 
-    selected: list[Proposal] = []
+    selected: list[Proposal] = list(initial[:count])
     while len(selected) < count:
         progressed = False
         active_bins = sorted(
@@ -1025,6 +1049,8 @@ def select_stratified_proposals(
             group = grouped[index]
             while group:
                 candidate = group.pop(0)
+                if candidate in selected:
+                    continue
                 if far_enough_from_selected(candidate, selected, domain, config):
                     selected.append(candidate)
                     progressed = True
@@ -1043,6 +1069,61 @@ def select_stratified_proposals(
             if len(selected) >= count:
                 break
     return selected
+
+
+def select_adaptive_proposals(
+    proposals: Sequence[Proposal],
+    domain: Domain,
+    config: ModelConfig,
+    count: int,
+) -> list[Proposal]:
+    """Reserve batch capacity for exact brackets and both x-domain edges."""
+    if count <= 0:
+        return []
+
+    ordered = sorted(proposals, key=lambda item: (-item.score, item.x, item.y))
+    selected: list[Proposal] = []
+    edge_tolerance = max(
+        transformed_span(domain.x_min, domain.x_max, config.x_scale, "x") * 1e-9,
+        1e-12,
+    )
+    for edge in (domain.x_min, domain.x_max):
+        edge_t = transformed_value(edge, config.x_scale, "x")
+        candidate = next(
+            (
+                item
+                for item in ordered
+                if abs(transformed_value(item.x, config.x_scale, "x") - edge_t)
+                <= edge_tolerance
+                and far_enough_from_selected(item, selected, domain, config)
+            ),
+            None,
+        )
+        if candidate is not None:
+            selected.append(candidate)
+        if len(selected) >= count:
+            return selected
+
+    bracket_quota = max(1, count // 2)
+    for candidate in ordered:
+        if "bisects observed label bracket" not in candidate.reason:
+            continue
+        if candidate in selected:
+            continue
+        if far_enough_from_selected(candidate, selected, domain, config):
+            selected.append(candidate)
+        if len(selected) >= count or sum(
+            "bisects observed label bracket" in item.reason for item in selected
+        ) >= bracket_quota:
+            break
+
+    return select_stratified_proposals(
+        ordered,
+        domain,
+        config,
+        count,
+        initial=selected,
+    )
 
 
 def choose_batch_counts(
@@ -1067,23 +1148,50 @@ def choose_batch_counts(
 
 
 def repeat_candidate_points(
-    aggregates: Sequence[AggregatePoint], requested_count: int
+    aggregates: Sequence[AggregatePoint],
+    requested_count: int,
+    domain: Domain | None = None,
+    config: ModelConfig | None = None,
 ) -> list[AggregatePoint]:
     if len(aggregates) <= 50:
         return list(aggregates)
     limit = max(50, requested_count * 16)
 
-    def cheap_repeat_score(point: AggregatePoint) -> tuple[float, float, float]:
+    def cheap_repeat_score(point: AggregatePoint) -> tuple[float, float]:
         disagreement = 1.0 - min(1.0, abs(point.rate - 0.5) * 2.0)
         low_repeat = 1.0 / max(point.n, 1)
         single_run = 1.0 if point.n == 1 else 0.0
         return (
             0.55 * disagreement + 0.35 * low_repeat + 0.10 * single_run,
             -point.n,
-            point.x,
         )
 
-    return sorted(aggregates, key=cheap_repeat_score, reverse=True)[:limit]
+    ordered = sorted(
+        aggregates,
+        key=lambda point: (*cheap_repeat_score(point), -point.x, -point.y),
+        reverse=True,
+    )
+    if domain is None or config is None:
+        return ordered[:limit]
+
+    bin_count = max(1, min(12, requested_count * 2 or 4))
+    grouped: dict[int, list[AggregatePoint]] = {
+        index: [] for index in range(bin_count)
+    }
+    for point in ordered:
+        grouped[x_bin_index(point.x, domain, config, bin_count)].append(point)
+    selected: list[AggregatePoint] = []
+    while len(selected) < limit:
+        progressed = False
+        for index in range(bin_count):
+            if grouped[index]:
+                selected.append(grouped[index].pop(0))
+                progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
 
 
 def propose_repeats(
@@ -1093,9 +1201,11 @@ def propose_repeats(
     rng: random.Random,
     count: int,
 ) -> list[Proposal]:
+    if count <= 0:
+        return []
     proposals: list[Proposal] = []
     contour_cache: dict[float, ContourEstimate] = {}
-    for point in repeat_candidate_points(aggregates, count):
+    for point in repeat_candidate_points(aggregates, count, domain, config):
         if point.x not in contour_cache:
             contour_cache[point.x] = contour_estimate(point.x, aggregates, domain, config, rng)
         contour = contour_cache[point.x]
@@ -1468,7 +1578,7 @@ def propose_new_points(
             add_candidate(x, y, source="x-from-y locator", vertical_probe=0.0)
 
     proposals.sort(key=lambda proposal: (-proposal.score, proposal.x, proposal.y))
-    return select_stratified_proposals(proposals, domain, config, count)
+    return select_adaptive_proposals(proposals, domain, config, count)
 
 
 def propose_next_batch(
@@ -1490,28 +1600,43 @@ def propose_next_batch(
     repeats = propose_repeats(aggregates, domain, config, rng, repeat_count)
     new_points = propose_new_points(aggregates, domain, config, rng, new_count)
 
-    if len(repeats) < repeat_count:
-        new_points.extend(
-            propose_new_points(
-                aggregates,
-                domain,
-                config,
-                rng,
-                new_count + repeat_count - len(repeats),
-            )[len(new_points) :]
+    selected_new = list(new_points[:new_count])
+    selected_repeats = list(repeats[:repeat_count])
+    repeat_index = 0
+    while len(selected_repeats) < repeat_count and repeats:
+        selected_repeats.append(repeats[repeat_index % len(repeats)])
+        repeat_index += 1
+    batch = [*selected_new, *selected_repeats]
+    fallback: list[Proposal] = []
+    if len(batch) < n_simulations:
+        fallback_new = propose_new_points(
+            aggregates, domain, config, rng, n_simulations
         )
-    if len(new_points) < new_count:
-        repeats.extend(
-            propose_repeats(
-                aggregates,
-                domain,
-                config,
-                rng,
-                repeat_count + new_count - len(new_points),
-            )[len(repeats) :]
+        fallback_repeats = propose_repeats(
+            aggregates, domain, config, rng, n_simulations
+        )
+        fallback = [*fallback_new, *fallback_repeats]
+    for proposal in fallback:
+        if len(batch) >= n_simulations:
+            break
+        if proposal not in batch:
+            batch.append(proposal)
+
+    # Parallel campaigns may legitimately run multiple independent repeats at
+    # the same informative coordinate. Cycling the best repeat candidates is
+    # preferable to silently returning a short batch.
+    repeat_pool = repeats or [
+        proposal for proposal in fallback if proposal.proposal_type == "repeat"
+    ]
+    repeat_index = 0
+    while len(batch) < n_simulations and repeat_pool:
+        batch.append(repeat_pool[repeat_index % len(repeat_pool)])
+        repeat_index += 1
+    if len(batch) < n_simulations:
+        raise ValueError(
+            "Unable to construct the requested batch from the observed domain."
         )
 
-    batch = [*new_points[:new_count], *repeats[:repeat_count]]
     batch.sort(key=lambda proposal: (proposal.proposal_type != "new", -proposal.score))
     return batch[:n_simulations]
 

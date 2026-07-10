@@ -63,8 +63,24 @@ Oh: 0.001 to 0.1
 Set the run length with:
 
 ```bash
-python3 end-to-end-with-visualization-drop-injection.py --iterations 120
+python3 end-to-end-with-visualization-drop-injection.py --iterations 20
 ```
+
+For a real simulator, start with the rearmable batch template instead of the
+visualizer. Copy `examples/rearm_campaign.sh`, provide an initial completed CSV,
+and set `BATCH_RUNNER` to an adapter that consumes proposed `x,y` rows and writes
+completed `id` values. `assess_contour.py` stores a generic contour, transformed
+SSE movement, bracket coverage, and a `refining`, `stalled`, or `converged`
+state without access to a theoretical answer.
+
+The parameter comparison is reproducible with:
+
+```bash
+python3 benchmarks/benchmark_contours.py --output benchmark-results.csv
+```
+
+Known synthetic contours exist only in this benchmark and are used only after
+each batch to score normalized transformed-space SSE.
 
 ## Tests
 

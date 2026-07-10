@@ -68,6 +68,7 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
             completed_rows = self.read_rows(output_dir / "Sweep-1_completed.csv")
 
             self.assertTrue((output_dir / "index.html").exists())
+            self.assertTrue((output_dir / "Sweep-1_contour-final.csv").exists())
             self.assertIn("RUNNING - not converged yet", html)
             self.assertIn("CONVERGED", html)
             self.assertIn("COMPLETED", html)
@@ -126,6 +127,11 @@ class VisualizedDropInjectionWorkflowTests(unittest.TestCase):
                     "999",
                     "--convergence-boundary-tolerance",
                     "999",
+                    "--convergence-max-x-gap",
+                    "1",
+                    "--convergence-max-y-bracket-width",
+                    "1",
+                    "--convergence-allow-unbracketed-edges",
                     "--convergence-patience",
                     "1",
                     "--convergence-min-iterations",

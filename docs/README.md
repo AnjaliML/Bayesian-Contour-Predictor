@@ -22,6 +22,9 @@ objective to maximize.
 - [workflow.md](workflow.md): how to run iterative sweeps.
 - [model-and-acquisition.md](model-and-acquisition.md): model assumptions and scoring.
 - [drop-injection-mapping.md](drop-injection-mapping.md): how `Rr,Oh,id` maps into generic `x,y,id`.
+- `../assess_contour.py`: generic contour snapshots and theory-blind convergence state.
+- `../benchmarks/benchmark_contours.py`: offline transformed-space SSE benchmark.
+- `../examples/rearm_campaign.sh`: rearmable external-simulator batch loop.
 
 ## Required Input Shape
 
