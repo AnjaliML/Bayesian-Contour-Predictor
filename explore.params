@@ -1,0 +1,52 @@
+# Drop-injection active-learning defaults.
+# Values here are used by end-to-end-with-visualization-drop-injection.py.
+# Command-line flags override these values.
+
+seed = 11
+classifier = binary
+size_tolerance = 0.005
+iterations = 32
+initial_points = 24
+batch_size = 16
+n_new = auto
+n_repeats = 0
+
+# Parameter-space bounds from the drop-injection regime map.
+rr_min = 1
+rr_max = 100
+rr_scale = log10
+oh_min = 0.001
+oh_max = 0.1
+oh_scale = log10
+
+# Proposal model and display-performance controls.
+# posterior_samples = 0 is the fast interactive visualizer setting.
+# Increase it when uncertainty bands matter more than run speed.
+grid_size = 21
+posterior_samples = 2
+transition_width = 0.04
+label_noise = 0.005
+contour_fit = local-linear
+length_scale_x = 0.18
+length_scale_y = auto
+
+# Auxiliary exploration: reserve one of the default eight new-point slots for randomized
+# x anchors in sparse regions, with y probes below/near/above the transition.
+scarcity_fraction = 0.125
+scarcity_candidate_bins = 12
+scarcity_fan_width = 0.08
+
+preview_points = 101
+preview_grid_size = 21
+preview_every = 1
+preview_posterior_samples = 0
+convergence_rms_tolerance = 0.0015
+convergence_max_tolerance = 0.008
+convergence_boundary_tolerance = 0.004
+convergence_boundary_fraction = 0.12
+convergence_max_x_gap = 0.15
+convergence_max_y_bracket_width = 0.03
+convergence_patience = 3
+convergence_min_iterations = 5
+convergence_mode = both
+delay = 0.04

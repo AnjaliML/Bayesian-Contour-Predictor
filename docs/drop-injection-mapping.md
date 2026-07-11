@@ -1,0 +1,125 @@
+# Drop Injection Mapping
+
+The drop-injection example uses physical coordinates:
+
+```text
+Rr,Oh,id
+```
+
+For the process-agnostic workflow, map them as:
+
+```text
+Rr -> x
+Oh -> y
+```
+
+The labels remain project-specific:
+
+```text
+id = 1 -> drops
+id = 0 -> no drops
+```
+
+Run a proposal sweep with:
+
+```bash
+python3 propose_next_sweep.py examples/drop_injection_seed.csv \
+  --x-col Rr \
+  --y-col Oh \
+  --mode monotone-y \
+  --monotone-direction decreasing \
+  --x-scale log10 \
+  --y-scale log10 \
+  --x-min 1 \
+  --x-max 100 \
+  --y-min 0.001 \
+  --y-max 0.1 \
+  --outfile Sweep-1.csv \
+  --n-simulations 8 \
+  --seed 11
+```
+
+The output uses canonical `x,y` names. This keeps the learning method portable
+across projects. In this physical case, interpret output `x` as `Rr` and output
+`y` as `Oh`.
+
+The older `classify_drops.py` helper evaluates one fixed hand-coded transition:
+
+```text
+Oh_c(Rr) = 0.0326 - 0.0398 exp(-0.348 Rr)
+```
+
+`classify_drops_sized_based.py` evaluates a continuous size first, still using
+generic `x,y` inputs:
+
+```text
+x = Rr
+y = Oh
+r_d = 0.2 * (1 - sqrt(y / y_c(x)))
+id = 1 if r_d > 5e-3 else 0
+```
+
+Negative `r_d` values are clamped to `0`, so the helper never reports a
+negative physical size.
+
+The implied binary threshold contour is:
+
+```text
+y = (1 - 5e-3 / 0.2)^2 * y_c(x)
+```
+
+So the existing binary active learner can be used first by converting measured
+sizes to `id` with a configured size tolerance.
+
+The new proposal engine is different: it learns a contour from campaign data
+and proposes the next informative experiments.
+
+## Visual End-To-End Demo
+
+Run:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py
+```
+
+By default this runs 60 active-learning sweeps. Use `--iterations N` or
+`--n-iterations N` for longer campaigns.
+
+The default bounds and scales are stored in [../explore.params](../explore.params):
+
+```text
+rr_min = 1
+rr_max = 100
+rr_scale = log10
+oh_min = 0.001
+oh_max = 0.1
+oh_scale = log10
+```
+
+This script keeps the drop-injection physical labels visible in the animation:
+
+- `Rr` is shown on the horizontal axis.
+- `Oh` is shown on a log-scaled vertical axis.
+- green points are `id = 1`, drops.
+- red points are `id = 0`, no drops.
+- outlined points are the next proposed experiments.
+
+Under the hood, acquisition still flows through the generic `x,y,id` proposal
+engine. By default each simulated experiment label is produced by
+`classify_drops.py`.
+
+To use the size-threshold helper instead, run:
+
+```bash
+python3 end-to-end-with-visualization-drop-injection.py --classifier size-based
+```
+
+or set this in [../explore.params](../explore.params):
+
+```text
+classifier = size-based
+size_tolerance = 0.005
+```
+
+The visualizer switches both the simulated labels and the dashed reference
+contour to the selected classifier.

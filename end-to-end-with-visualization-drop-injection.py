@@ -1,0 +1,2221 @@
+#!/usr/bin/env python3
+"""Run and visualize the drop-injection end-to-end active-learning workflow."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import random
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Sequence
+
+from classify_drops import oh_c as binary_oh_c
+from classify_drops_sized_based import DEFAULT_SIZE_TOLERANCE, size_threshold_y
+import assess_contour as assessment
+import propose_next_sweep as sweep
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+PROPOSE_SCRIPT = REPO_ROOT / "propose_next_sweep.py"
+CLASSIFIER_SCRIPTS = {
+    "binary": REPO_ROOT / "classify_drops.py",
+    "size-based": REPO_ROOT / "classify_drops_sized_based.py",
+}
+DEFAULT_PARAMS_FILE = REPO_ROOT / "explore.params"
+VISIBLE_MESSAGE_COUNT = 16
+
+
+def optional_int(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"auto", "default", "none", ""}:
+        return None
+    return int(value)
+
+
+def optional_float(value: str) -> float | None:
+    normalized = value.strip().lower()
+    if normalized in {"auto", "default", "none", ""}:
+        return None
+    return float(value)
+
+
+DEFAULT_PARAMS: dict[str, Any] = {
+    "iterations": 20,
+    "initial_points": 24,
+    "batch_size": 8,
+    "n_new": None,
+    "n_repeats": 0,
+    "seed": 11,
+    "classifier": "binary",
+    "size_tolerance": DEFAULT_SIZE_TOLERANCE,
+    "rr_min": 1.0,
+    "rr_max": 100.0,
+    "rr_scale": "log10",
+    "oh_min": 0.001,
+    "oh_max": 0.1,
+    "oh_scale": "log10",
+    "grid_size": 21,
+    "posterior_samples": 0,
+    "transition_width": 0.04,
+    "label_noise": 0.005,
+    "contour_fit": "local-linear",
+    "length_scale_x": 0.18,
+    "length_scale_y": None,
+    "scarcity_fraction": 0.125,
+    "scarcity_candidate_bins": 12,
+    "scarcity_fan_width": 0.08,
+    "preview_points": 101,
+    "preview_grid_size": 21,
+    "preview_every": 1,
+    "preview_posterior_samples": 0,
+    "convergence_rms_tolerance": 0.0015,
+    "convergence_max_tolerance": 0.008,
+    "convergence_boundary_tolerance": 0.004,
+    "convergence_boundary_fraction": 0.12,
+    "convergence_max_x_gap": 0.15,
+    "convergence_max_y_bracket_width": 0.03,
+    "convergence_patience": 3,
+    "convergence_min_iterations": 5,
+    "convergence_mode": "both",
+    "delay": 0.04,
+}
+PARAM_TYPES = {
+    "iterations": int,
+    "initial_points": int,
+    "batch_size": int,
+    "n_new": optional_int,
+    "n_repeats": optional_int,
+    "seed": int,
+    "classifier": str,
+    "size_tolerance": float,
+    "rr_min": float,
+    "rr_max": float,
+    "rr_scale": str,
+    "oh_min": float,
+    "oh_max": float,
+    "oh_scale": str,
+    "grid_size": int,
+    "posterior_samples": int,
+    "transition_width": float,
+    "label_noise": float,
+    "contour_fit": str,
+    "length_scale_x": optional_float,
+    "length_scale_y": optional_float,
+    "scarcity_fraction": float,
+    "scarcity_candidate_bins": int,
+    "scarcity_fan_width": float,
+    "preview_points": int,
+    "preview_grid_size": int,
+    "preview_every": int,
+    "preview_posterior_samples": int,
+    "convergence_rms_tolerance": float,
+    "convergence_max_tolerance": float,
+    "convergence_boundary_tolerance": float,
+    "convergence_boundary_fraction": float,
+    "convergence_max_x_gap": float,
+    "convergence_max_y_bracket_width": float,
+    "convergence_patience": int,
+    "convergence_min_iterations": int,
+    "convergence_mode": str,
+    "delay": float,
+}
+
+
+@dataclass(frozen=True)
+class Domain:
+    rr_min: float
+    rr_max: float
+    rr_scale: str
+    oh_min: float
+    oh_max: float
+    oh_scale: str
+
+
+@dataclass(frozen=True)
+class CompletedRun:
+    case_id: str
+    rr: float
+    oh: float
+    label: int
+    sweep: int
+
+
+@dataclass(frozen=True)
+class ProposedRun:
+    case_id: str
+    rr: float
+    oh: float
+    proposal_type: str
+    score: float
+    p_positive_pred: float
+    y_c_pred: float
+    y_c_q05: float
+    y_c_q95: float
+    y_c_std: float
+    reason: str
+
+
+class DirectoryHandler(SimpleHTTPRequestHandler):
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def load_params_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    params: dict[str, Any] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError(f"{path}:{line_number} expected key = value")
+        key, value = [part.strip() for part in line.split("=", 1)]
+        key = key.replace("-", "_")
+        if key not in PARAM_TYPES:
+            raise ValueError(f"{path}:{line_number} unknown parameter {key!r}")
+        try:
+            params[key] = PARAM_TYPES[key](value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{path}:{line_number} could not parse {key!r} value {value!r}"
+            ) from exc
+    return params
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--params-file", type=Path, default=DEFAULT_PARAMS_FILE)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+    defaults = {**DEFAULT_PARAMS, **load_params_file(pre_args.params_file)}
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Animate a drop-injection active-learning campaign by calling "
+            "propose_next_sweep.py and a selected classifier under the hood."
+        ),
+        parents=[pre_parser],
+    )
+    parser.add_argument(
+        "--iterations",
+        "--n-iterations",
+        type=int,
+        default=defaults["iterations"],
+        help="Number of active-learning sweeps to run.",
+    )
+    parser.add_argument("--initial-points", type=int, default=defaults["initial_points"])
+    parser.add_argument("--batch-size", type=int, default=defaults["batch_size"])
+    parser.add_argument(
+        "--n-new",
+        type=optional_int,
+        default=defaults["n_new"],
+        help="New coordinates per sweep. Use 'auto' to let propose_next_sweep.py choose.",
+    )
+    parser.add_argument(
+        "--n-repeats",
+        type=optional_int,
+        default=defaults["n_repeats"],
+        help="Repeat coordinates per sweep. Use 'auto' to let propose_next_sweep.py choose.",
+    )
+    parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument(
+        "--classifier",
+        choices=["binary", "size-based"],
+        default=defaults["classifier"],
+        help="Experiment runner used for simulated labels and the dashed reference contour.",
+    )
+    parser.add_argument(
+        "--size-tolerance",
+        type=float,
+        default=defaults["size_tolerance"],
+        help="Size threshold used by --classifier size-based.",
+    )
+    parser.add_argument("--rr-min", type=float, default=defaults["rr_min"])
+    parser.add_argument("--rr-max", type=float, default=defaults["rr_max"])
+    parser.add_argument("--rr-scale", choices=["linear", "log10"], default=defaults["rr_scale"])
+    parser.add_argument("--oh-min", type=float, default=defaults["oh_min"])
+    parser.add_argument("--oh-max", type=float, default=defaults["oh_max"])
+    parser.add_argument("--oh-scale", choices=["linear", "log10"], default=defaults["oh_scale"])
+    parser.add_argument("--grid-size", type=int, default=defaults["grid_size"])
+    parser.add_argument("--posterior-samples", type=int, default=defaults["posterior_samples"])
+    parser.add_argument("--transition-width", type=float, default=defaults["transition_width"])
+    parser.add_argument("--label-noise", type=float, default=defaults["label_noise"])
+    parser.add_argument(
+        "--contour-fit",
+        choices=["local-constant", "local-linear", "adaptive-linear"],
+        default=defaults["contour_fit"],
+    )
+    parser.add_argument("--length-scale-x", type=optional_float, default=defaults["length_scale_x"])
+    parser.add_argument("--length-scale-y", type=optional_float, default=defaults["length_scale_y"])
+    parser.add_argument("--scarcity-fraction", type=float, default=defaults["scarcity_fraction"])
+    parser.add_argument(
+        "--scarcity-candidate-bins",
+        type=int,
+        default=defaults["scarcity_candidate_bins"],
+    )
+    parser.add_argument("--scarcity-fan-width", type=float, default=defaults["scarcity_fan_width"])
+    parser.add_argument("--preview-points", type=int, default=defaults["preview_points"])
+    parser.add_argument("--preview-grid-size", type=int, default=defaults["preview_grid_size"])
+    parser.add_argument("--preview-every", type=int, default=defaults["preview_every"])
+    parser.add_argument(
+        "--preview-posterior-samples",
+        type=int,
+        default=defaults["preview_posterior_samples"],
+    )
+    parser.add_argument(
+        "--convergence-rms-tolerance",
+        type=float,
+        default=defaults["convergence_rms_tolerance"],
+        help="Stop early when RMS transformed contour movement remains below this value.",
+    )
+    parser.add_argument(
+        "--convergence-max-tolerance",
+        type=float,
+        default=defaults["convergence_max_tolerance"],
+        help="Stop early only if the largest pointwise contour movement is below this value.",
+    )
+    parser.add_argument(
+        "--convergence-boundary-tolerance",
+        type=float,
+        default=defaults["convergence_boundary_tolerance"],
+        help="Stop early only if edge-region contour movement is below this value.",
+    )
+    parser.add_argument(
+        "--convergence-boundary-fraction",
+        type=float,
+        default=defaults["convergence_boundary_fraction"],
+        help="Fraction of each x/y edge tracked by the boundary convergence check.",
+    )
+    parser.add_argument(
+        "--convergence-patience",
+        type=int,
+        default=defaults["convergence_patience"],
+        help="Number of consecutive convergence checks required before stopping.",
+    )
+    parser.add_argument(
+        "--convergence-max-x-gap",
+        type=float,
+        default=defaults["convergence_max_x_gap"],
+        help="Require bracketed x anchors to leave no larger normalized x gap.",
+    )
+    parser.add_argument(
+        "--convergence-max-y-bracket-width",
+        type=float,
+        default=defaults["convergence_max_y_bracket_width"],
+        help="Require every observed y bracket to be this narrow in transformed space.",
+    )
+    parser.add_argument(
+        "--convergence-allow-unbracketed-edges",
+        action="store_true",
+        help="Allow convergence without exact brackets at both x edges.",
+    )
+    parser.add_argument(
+        "--convergence-min-iterations",
+        type=int,
+        default=defaults["convergence_min_iterations"],
+        help="Minimum completed sweeps before convergence stopping is allowed.",
+    )
+    parser.add_argument(
+        "--convergence-mode",
+        choices=["y", "x", "both"],
+        default=defaults["convergence_mode"],
+        help="Compare Y(x), X(y), or both transformed contour views.",
+    )
+    parser.add_argument("--delay", type=float, default=defaults["delay"])
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--no-server", action="store_true")
+    parser.add_argument("--no-hold", action="store_true")
+    return parser.parse_args(argv)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.iterations < 1:
+        raise ValueError("--iterations must be at least 1")
+    if args.initial_points < 2:
+        raise ValueError("--initial-points must be at least 2")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.n_new is not None and args.n_new < 0:
+        raise ValueError("--n-new cannot be negative")
+    if args.n_repeats is not None and args.n_repeats < 0:
+        raise ValueError("--n-repeats cannot be negative")
+    if args.n_new is not None and args.n_new > args.batch_size:
+        raise ValueError("--n-new cannot exceed --batch-size")
+    if args.n_repeats is not None and args.n_repeats > args.batch_size:
+        raise ValueError("--n-repeats cannot exceed --batch-size")
+    if (
+        args.n_new is not None
+        and args.n_repeats is not None
+        and args.n_new + args.n_repeats != args.batch_size
+    ):
+        raise ValueError("--n-new plus --n-repeats must equal --batch-size")
+    if args.rr_min >= args.rr_max:
+        raise ValueError("--rr-min must be less than --rr-max")
+    if args.size_tolerance < 0:
+        raise ValueError("--size-tolerance cannot be negative")
+    if args.oh_min <= 0 or args.oh_min >= args.oh_max:
+        raise ValueError("--oh-min must be positive and less than --oh-max")
+    if args.rr_scale == "log10" and args.rr_min <= 0:
+        raise ValueError("--rr-scale log10 requires --rr-min to be positive")
+    if args.oh_scale == "log10" and args.oh_min <= 0:
+        raise ValueError("--oh-scale log10 requires --oh-min to be positive")
+    if args.grid_size < 5:
+        raise ValueError("--grid-size must be at least 5")
+    if args.posterior_samples < 0:
+        raise ValueError("--posterior-samples cannot be negative")
+    if args.transition_width <= 0:
+        raise ValueError("--transition-width must be positive")
+    if not 0 <= args.label_noise < 0.5:
+        raise ValueError("--label-noise must be in [0, 0.5)")
+    if args.length_scale_x is not None and args.length_scale_x <= 0:
+        raise ValueError("--length-scale-x must be positive or auto")
+    if args.length_scale_y is not None and args.length_scale_y <= 0:
+        raise ValueError("--length-scale-y must be positive or auto")
+    if not 0 <= args.scarcity_fraction <= 1:
+        raise ValueError("--scarcity-fraction must be between 0 and 1")
+    if args.scarcity_candidate_bins < 2:
+        raise ValueError("--scarcity-candidate-bins must be at least 2")
+    if not 0 < args.scarcity_fan_width <= 0.5:
+        raise ValueError("--scarcity-fan-width must be in (0, 0.5]")
+    if args.preview_points < 2:
+        raise ValueError("--preview-points must be at least 2")
+    if args.preview_grid_size < 5:
+        raise ValueError("--preview-grid-size must be at least 5")
+    if args.preview_every < 1:
+        raise ValueError("--preview-every must be at least 1")
+    if args.preview_posterior_samples < 0:
+        raise ValueError("--preview-posterior-samples cannot be negative")
+    if args.convergence_rms_tolerance < 0:
+        raise ValueError("--convergence-rms-tolerance cannot be negative")
+    if args.convergence_max_tolerance < 0:
+        raise ValueError("--convergence-max-tolerance cannot be negative")
+    if args.convergence_boundary_tolerance < 0:
+        raise ValueError("--convergence-boundary-tolerance cannot be negative")
+    if not 0 <= args.convergence_boundary_fraction <= 0.5:
+        raise ValueError("--convergence-boundary-fraction must be between 0 and 0.5")
+    if not 0 < args.convergence_max_x_gap <= 1:
+        raise ValueError("--convergence-max-x-gap must be in (0, 1]")
+    if not 0 < args.convergence_max_y_bracket_width <= 1:
+        raise ValueError("--convergence-max-y-bracket-width must be in (0, 1]")
+    if args.convergence_patience < 1:
+        raise ValueError("--convergence-patience must be at least 1")
+    if args.convergence_min_iterations < 0:
+        raise ValueError("--convergence-min-iterations cannot be negative")
+    if args.delay < 0:
+        raise ValueError("--delay cannot be negative")
+
+
+def default_output_dir() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return REPO_ROOT / "visualization_runs" / f"drop-injection-{stamp}"
+
+
+def write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def format_float(value: float) -> str:
+    return f"{value:.10g}"
+
+
+def scaled_value(value: float, scale: str) -> float:
+    return math.log10(value) if scale == "log10" else value
+
+
+def inverse_scaled_value(value: float, scale: str) -> float:
+    return 10**value if scale == "log10" else value
+
+
+def value_at_fraction(lower: float, upper: float, fraction: float, scale: str) -> float:
+    lower_t = scaled_value(lower, scale)
+    upper_t = scaled_value(upper, scale)
+    return inverse_scaled_value(lower_t + fraction * (upper_t - lower_t), scale)
+
+
+def classify_drop(
+    rr: float,
+    oh: float,
+    *,
+    classifier: str,
+    size_tolerance: float,
+) -> int:
+    if classifier == "binary":
+        command = [
+            sys.executable,
+            str(CLASSIFIER_SCRIPTS[classifier]),
+            format_float(oh),
+            format_float(rr),
+        ]
+    elif classifier == "size-based":
+        command = [
+            sys.executable,
+            str(CLASSIFIER_SCRIPTS[classifier]),
+            format_float(rr),
+            format_float(oh),
+            "--size-tolerance",
+            format_float(size_tolerance),
+        ]
+    else:
+        raise ValueError(f"unknown classifier {classifier!r}")
+    result = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    output = result.stdout.strip()
+    if output not in {"0", "1"}:
+        raise RuntimeError(f"{CLASSIFIER_SCRIPTS[classifier].name} returned unexpected output {output!r}")
+    return int(output)
+
+
+def make_initial_design(
+    count: int,
+    domain: Domain,
+    seed: int,
+    *,
+    classifier: str,
+    size_tolerance: float,
+) -> list[CompletedRun]:
+    rng = random.Random(seed)
+    rr_slots = list(range(count))
+    oh_slots = list(range(count))
+    rng.shuffle(rr_slots)
+    rng.shuffle(oh_slots)
+
+    runs: list[CompletedRun] = []
+    for index in range(count):
+        rr_fraction = (rr_slots[index] + 0.5) / count
+        oh_fraction = (oh_slots[index] + 0.5) / count
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, rr_fraction, domain.rr_scale)
+        oh = value_at_fraction(domain.oh_min, domain.oh_max, oh_fraction, domain.oh_scale)
+        label = classify_drop(
+            rr,
+            oh,
+            classifier=classifier,
+            size_tolerance=size_tolerance,
+        )
+        runs.append(
+            CompletedRun(
+                case_id=str(index + 1),
+                rr=rr,
+                oh=oh,
+                label=label,
+                sweep=0,
+            )
+        )
+    return runs
+
+
+def completed_runs_to_rows(runs: Sequence[CompletedRun]) -> list[dict[str, str]]:
+    return [
+        {
+            "caseId": run.case_id,
+            "Rr": format_float(run.rr),
+            "Oh": format_float(run.oh),
+            "id": str(run.label),
+        }
+        for run in runs
+    ]
+
+
+def write_completed_sweep(path: Path, runs: Sequence[CompletedRun]) -> None:
+    write_csv(path, ["caseId", "Rr", "Oh", "id"], completed_runs_to_rows(runs))
+
+
+def run_proposal(
+    input_files: Sequence[Path],
+    outfile: Path,
+    domain: Domain,
+    *,
+    n_simulations: int,
+    seed: int,
+    grid_size: int,
+    posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
+    scarcity_fraction: float,
+    scarcity_candidate_bins: int,
+    scarcity_fan_width: float,
+    n_new: int | None = None,
+    n_repeats: int | None = None,
+) -> list[dict[str, str]]:
+    command = [
+        sys.executable,
+        str(PROPOSE_SCRIPT),
+        *[str(path) for path in input_files],
+        "--outfile",
+        str(outfile),
+        "--n-simulations",
+        str(n_simulations),
+        "--seed",
+        str(seed),
+        "--x-col",
+        "Rr",
+        "--y-col",
+        "Oh",
+        "--mode",
+        "monotone-y",
+        "--monotone-direction",
+        "decreasing",
+        "--x-scale",
+        domain.rr_scale,
+        "--y-scale",
+        domain.oh_scale,
+        "--x-min",
+        format_float(domain.rr_min),
+        "--x-max",
+        format_float(domain.rr_max),
+        "--y-min",
+        format_float(domain.oh_min),
+        "--y-max",
+        format_float(domain.oh_max),
+        "--grid-size",
+        str(grid_size),
+        "--posterior-samples",
+        str(posterior_samples),
+        "--transition-width",
+        format_float(transition_width),
+        "--label-noise",
+        format_float(label_noise),
+        "--contour-fit",
+        contour_fit,
+        "--scarcity-fraction",
+        format_float(scarcity_fraction),
+        "--scarcity-candidate-bins",
+        str(scarcity_candidate_bins),
+        "--scarcity-fan-width",
+        format_float(scarcity_fan_width),
+    ]
+    if n_new is not None:
+        command.extend(["--n-new", str(n_new)])
+    if n_repeats is not None:
+        command.extend(["--n-repeats", str(n_repeats)])
+    if length_scale_x is not None:
+        command.extend(["--length-scale-x", format_float(length_scale_x)])
+    if length_scale_y is not None:
+        command.extend(["--length-scale-y", format_float(length_scale_y)])
+    subprocess.run(command, check=True)
+    return read_csv(outfile)
+
+
+def proposal_from_row(row: dict[str, str]) -> ProposedRun:
+    return ProposedRun(
+        case_id=row["caseId"],
+        rr=float(row["x"]),
+        oh=float(row["y"]),
+        proposal_type=row.get("proposal_type", "new"),
+        score=float(row.get("score", "0") or 0.0),
+        p_positive_pred=float(row.get("p_positive_pred", "0.5") or 0.5),
+        y_c_pred=float(row.get("y_c_pred", row["y"]) or row["y"]),
+        y_c_q05=float(row.get("y_c_q05", row["y"]) or row["y"]),
+        y_c_q95=float(row.get("y_c_q95", row["y"]) or row["y"]),
+        y_c_std=float(row.get("y_c_std", "0") or 0.0),
+        reason=row.get("reason", ""),
+    )
+
+
+def proposal_rows_to_completed(
+    rows: Sequence[dict[str, str]],
+    sweep: int,
+    *,
+    classifier: str,
+    size_tolerance: float,
+) -> list[CompletedRun]:
+    completed: list[CompletedRun] = []
+    for row in rows:
+        rr = float(row["x"])
+        oh = float(row["y"])
+        completed.append(
+            CompletedRun(
+                case_id=row["caseId"],
+                rr=rr,
+                oh=oh,
+                label=classify_drop(
+                    rr,
+                    oh,
+                    classifier=classifier,
+                    size_tolerance=size_tolerance,
+                ),
+                sweep=sweep,
+            )
+        )
+    return completed
+
+
+def true_contour_y(rr: float, *, classifier: str, size_tolerance: float) -> float:
+    if classifier == "binary":
+        return binary_oh_c(rr)
+    if classifier == "size-based":
+        return size_threshold_y(rr, size_tolerance)
+    raise ValueError(f"unknown classifier {classifier!r}")
+
+
+def find_true_contour(
+    domain: Domain,
+    *,
+    classifier: str,
+    size_tolerance: float,
+    samples: int = 80,
+) -> list[dict[str, float]]:
+    contour: list[dict[str, float]] = []
+    for index in range(samples):
+        fraction = index / (samples - 1) if samples > 1 else 0.5
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, fraction, domain.rr_scale)
+        oh = true_contour_y(
+            rr,
+            classifier=classifier,
+            size_tolerance=size_tolerance,
+        )
+        if domain.oh_min <= oh <= domain.oh_max:
+            contour.append({"Rr": rr, "Oh": oh})
+    return contour
+
+
+def model_preview_config(
+    domain: Domain,
+    grid_size: int,
+    posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
+) -> sweep.ModelConfig:
+    model_domain = sweep.Domain(
+        x_min=domain.rr_min,
+        x_max=domain.rr_max,
+        y_min=domain.oh_min,
+        y_max=domain.oh_max,
+    )
+    return sweep.ModelConfig(
+        mode="monotone-y",
+        monotone_direction="decreasing",
+        contour_fit=contour_fit,
+        x_scale=domain.rr_scale,
+        y_scale=domain.oh_scale,
+        transition_width=transition_width,
+        label_noise=label_noise,
+        length_scale_x=length_scale_x or sweep.default_length_scale(
+            sweep.transformed_span(
+                model_domain.x_min, model_domain.x_max, domain.rr_scale, "x"
+            )
+        ),
+        length_scale_y=length_scale_y or sweep.default_length_scale(
+            sweep.transformed_span(
+                model_domain.y_min, model_domain.y_max, domain.oh_scale, "y"
+            )
+        ),
+        prior_alpha=1.0,
+        prior_beta=1.0,
+        grid_size=grid_size,
+        posterior_samples=posterior_samples,
+    )
+
+
+def build_model_preview_contour(
+    input_files: Sequence[Path],
+    domain: Domain,
+    *,
+    points: int,
+    grid_size: int,
+    posterior_samples: int,
+    transition_width: float,
+    label_noise: float,
+    contour_fit: str,
+    length_scale_x: float | None,
+    length_scale_y: float | None,
+    seed: int,
+) -> list[dict[str, float]]:
+    observations, _ = sweep.read_csv_files(
+        input_files,
+        case_col="caseId",
+        x_col="Rr",
+        y_col="Oh",
+        label_col="id",
+    )
+    model_domain = sweep.Domain(
+        x_min=domain.rr_min,
+        x_max=domain.rr_max,
+        y_min=domain.oh_min,
+        y_max=domain.oh_max,
+    )
+    config = model_preview_config(
+        domain,
+        grid_size,
+        posterior_samples,
+        transition_width,
+        label_noise,
+        contour_fit,
+        length_scale_x,
+        length_scale_y,
+    )
+    aggregates = sweep.aggregate_observations(observations)
+    rng = random.Random(seed)
+
+    contour: list[dict[str, float]] = []
+    for index in range(points):
+        fraction = index / (points - 1) if points > 1 else 0.5
+        rr = value_at_fraction(domain.rr_min, domain.rr_max, fraction, domain.rr_scale)
+        estimate = sweep.contour_estimate(rr, aggregates, model_domain, config, rng)
+        contour.append(
+            {
+                "Rr": rr,
+                "y_c_pred": estimate.y_c_pred,
+                "y_c_q05": estimate.y_c_q05,
+                "y_c_q95": estimate.y_c_q95,
+            }
+        )
+    return contour
+
+
+def write_preview_contour(path: Path, contour: Sequence[dict[str, float]]) -> None:
+    write_csv(
+        path,
+        ["Rr", "y_c_pred", "y_c_q05", "y_c_q95"],
+        [
+            {
+                "Rr": format_float(row["Rr"]),
+                "y_c_pred": format_float(row["y_c_pred"]),
+                "y_c_q05": format_float(row["y_c_q05"]),
+                "y_c_q95": format_float(row["y_c_q95"]),
+            }
+            for row in contour
+        ],
+    )
+
+
+def interpolate_contour_x_at_y(
+    contour: Sequence[dict[str, float]], y_value: float, domain: Domain
+) -> float:
+    valid = sorted(
+        (
+            row
+            for row in contour
+            if row.get("Rr", 0) > 0 and row.get("y_c_pred", 0) > 0
+        ),
+        key=lambda row: row["Rr"],
+    )
+    if not valid:
+        return domain.rr_min
+    target_y = scaled_value(y_value, domain.oh_scale)
+    candidates: list[float] = []
+    for left, right in zip(valid, valid[1:]):
+        left_y = scaled_value(left["y_c_pred"], domain.oh_scale)
+        right_y = scaled_value(right["y_c_pred"], domain.oh_scale)
+        if abs(left_y - target_y) <= 1e-12:
+            candidates.append(left["Rr"])
+            continue
+        if abs(right_y - target_y) <= 1e-12:
+            candidates.append(right["Rr"])
+            continue
+        if (left_y - target_y) * (right_y - target_y) > 0:
+            continue
+        denominator = right_y - left_y
+        if abs(denominator) <= 1e-12:
+            continue
+        fraction = max(0.0, min(1.0, (target_y - left_y) / denominator))
+        left_x = scaled_value(left["Rr"], domain.rr_scale)
+        right_x = scaled_value(right["Rr"], domain.rr_scale)
+        candidates.append(inverse_scaled_value(left_x + fraction * (right_x - left_x), domain.rr_scale))
+    if candidates:
+        return sorted(candidates)[len(candidates) // 2]
+    nearest = min(
+        valid,
+        key=lambda row: abs(scaled_value(row["y_c_pred"], domain.oh_scale) - target_y),
+    )
+    return nearest["Rr"]
+
+
+def contour_change_metrics(
+    previous: Sequence[dict[str, float]],
+    current: Sequence[dict[str, float]],
+    domain: Domain,
+    mode: str,
+    boundary_fraction: float,
+) -> dict[str, float] | None:
+    if not previous or not current:
+        return None
+    deltas: list[float] = []
+    boundary_deltas: list[float] = []
+
+    def add_delta(delta: float, fraction: float) -> None:
+        deltas.append(delta)
+        if fraction <= boundary_fraction or fraction >= 1.0 - boundary_fraction:
+            boundary_deltas.append(delta)
+
+    if mode in {"y", "both"}:
+        points = min(len(previous), len(current))
+        for index, (before, after) in enumerate(zip(previous, current)):
+            before_y = before.get("y_c_pred", 0)
+            after_y = after.get("y_c_pred", 0)
+            if before_y <= 0 or after_y <= 0:
+                continue
+            delta = scaled_value(after_y, domain.oh_scale) - scaled_value(before_y, domain.oh_scale)
+            fraction = index / (points - 1) if points > 1 else 0.5
+            add_delta(delta, fraction)
+    if mode in {"x", "both"}:
+        points = min(len(previous), len(current))
+        if points >= 2:
+            for index in range(points):
+                fraction = index / (points - 1)
+                y_value = value_at_fraction(domain.oh_min, domain.oh_max, fraction, domain.oh_scale)
+                before_x = interpolate_contour_x_at_y(previous, y_value, domain)
+                after_x = interpolate_contour_x_at_y(current, y_value, domain)
+                delta = scaled_value(after_x, domain.rr_scale) - scaled_value(before_x, domain.rr_scale)
+                add_delta(delta, fraction)
+    if not deltas:
+        return None
+    sum_sq = sum(delta * delta for delta in deltas)
+    rms = math.sqrt(sum_sq / len(deltas))
+    max_delta = max(abs(delta) for delta in deltas)
+    boundary_max = max((abs(delta) for delta in boundary_deltas), default=max_delta)
+    return {
+        "rms": rms,
+        "max": max_delta,
+        "boundary_max": boundary_max,
+        "points": float(len(deltas)),
+    }
+
+
+def write_state(output_dir: Path, state: dict[str, Any]) -> None:
+    with (output_dir / "state.json").open("w") as handle:
+        json.dump(state, handle, indent=2)
+
+
+def completed_payload(runs: Sequence[CompletedRun]) -> list[dict[str, Any]]:
+    return [
+        {
+            "caseId": run.case_id,
+            "Rr": run.rr,
+            "Oh": run.oh,
+            "id": run.label,
+            "sweep": run.sweep,
+        }
+        for run in runs
+    ]
+
+
+def proposals_payload(proposals: Sequence[ProposedRun]) -> list[dict[str, Any]]:
+    return [
+        {
+            "caseId": proposal.case_id,
+            "Rr": proposal.rr,
+            "Oh": proposal.oh,
+            "proposal_type": proposal.proposal_type,
+            "score": proposal.score,
+            "p_positive_pred": proposal.p_positive_pred,
+            "y_c_pred": proposal.y_c_pred,
+            "y_c_q05": proposal.y_c_q05,
+            "y_c_q95": proposal.y_c_q95,
+            "y_c_std": proposal.y_c_std,
+            "reason": proposal.reason,
+        }
+        for proposal in proposals
+    ]
+
+
+def update_visual_state(
+    output_dir: Path,
+    *,
+    status: str,
+    iteration: int,
+    total_iterations: int,
+    batch_size: int,
+    domain: Domain,
+    completed: Sequence[CompletedRun],
+    proposals: Sequence[ProposedRun],
+    contour: Sequence[dict[str, float]],
+    true_contour: Sequence[dict[str, float]],
+    history: Sequence[dict[str, Any]],
+    messages: Sequence[str],
+) -> None:
+    state = {
+        "status": status,
+        "iteration": iteration,
+        "total_iterations": total_iterations,
+        "batch_size": batch_size,
+        "domain": {
+            "rr_min": domain.rr_min,
+            "rr_max": domain.rr_max,
+            "rr_scale": domain.rr_scale,
+            "oh_min": domain.oh_min,
+            "oh_max": domain.oh_max,
+            "oh_scale": domain.oh_scale,
+        },
+        "completed": completed_payload(completed),
+        "proposals": proposals_payload(proposals),
+        "contour": list(contour),
+        "true_contour": list(true_contour),
+        "history": list(history),
+        "messages": list(messages[-VISIBLE_MESSAGE_COUNT:]),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    write_state(output_dir, state)
+
+
+def write_html(output_dir: Path) -> None:
+    (output_dir / "index.html").write_text(
+        """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drop Injection Active Learning Visualizer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #eef2ef;
+      --paper: #fbfcfb;
+      --panel: #ffffff;
+      --ink: #202933;
+      --muted: #657385;
+      --soft: #edf1f4;
+      --line: #d8e0df;
+      --drop: #0f8065;
+      --no-drop: #c4495a;
+      --proposal: #d99a22;
+      --curve: #2e63d3;
+      --truth: #26313d;
+      --band: rgba(46, 99, 211, 0.16);
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+    }
+    .app {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 14px;
+      min-height: 100vh;
+      max-width: 1880px;
+      margin: 0 auto;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .topbar {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 26px rgba(32, 41, 51, 0.07);
+      padding: 14px 16px;
+      display: grid;
+      grid-template-columns: minmax(260px, 1fr) minmax(260px, 520px);
+      gap: 18px;
+      align-items: center;
+    }
+    .title-block h1 {
+      font-size: 22px;
+      line-height: 1.15;
+      margin: 0 0 5px;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+    #subtitle {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .run-state {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      margin-top: 8px;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+      font-weight: 760;
+      letter-spacing: 0;
+      border: 1px solid var(--line);
+      background: #f7faf9;
+      color: var(--muted);
+    }
+    .run-state-running {
+      border-color: rgba(46, 99, 211, 0.28);
+      background: rgba(46, 99, 211, 0.08);
+      color: var(--curve);
+    }
+    .run-state-converged {
+      border-color: rgba(15, 128, 101, 0.28);
+      background: rgba(15, 128, 101, 0.10);
+      color: var(--drop);
+    }
+    .run-state-completed {
+      border-color: rgba(32, 41, 51, 0.22);
+      background: #f1f4f3;
+      color: var(--ink);
+    }
+    .progress-wrap {
+      display: grid;
+      gap: 8px;
+    }
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .progress-track {
+      height: 10px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    #progressFill {
+      width: 0%;
+      height: 100%;
+      background: var(--curve);
+      transition: width 220ms ease;
+    }
+    .content {
+      display: grid;
+      grid-template-columns: minmax(680px, 1fr) 370px;
+      gap: 14px;
+      min-height: 0;
+      align-items: start;
+    }
+    .plot-shell, aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 26px rgba(32, 41, 51, 0.07);
+      min-width: 0;
+    }
+    .plot-shell {
+      display: grid;
+      grid-template-rows: auto minmax(420px, 1fr);
+      overflow: hidden;
+    }
+    .plot-caption {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .caption-strong {
+      color: var(--ink);
+      font-weight: 700;
+      font-size: 13px;
+    }
+    canvas {
+      width: 100%;
+      height: clamp(480px, 68vh, 740px);
+      display: block;
+      background: var(--paper);
+    }
+    aside {
+      padding: 14px;
+      overflow: auto;
+      max-height: calc(100vh - 112px);
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fcfdfc;
+    }
+    .stat b {
+      display: block;
+      font-size: 19px;
+      line-height: 1.1;
+    }
+    .stat span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .status-panel {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fcfdfc;
+      margin-bottom: 14px;
+    }
+    .status-panel b {
+      display: block;
+      font-size: 15px;
+      line-height: 1.25;
+      margin-bottom: 4px;
+    }
+    .status-panel span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    h2 {
+      font-size: 13px;
+      margin: 16px 0 8px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      color: var(--muted);
+    }
+    .legend {
+      display: grid;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .timeline {
+      height: 92px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      overflow: hidden;
+      background: #fcfdfc;
+    }
+    .timeline-bar {
+      min-width: 3px;
+      max-width: 9px;
+      flex: 1 1 5px;
+      height: 100%;
+      display: flex;
+      flex-direction: column-reverse;
+      border-radius: 3px 3px 0 0;
+      overflow: hidden;
+      opacity: 0.92;
+    }
+    .timeline-drop {
+      background: var(--drop);
+    }
+    .timeline-no-drop {
+      background: var(--no-drop);
+    }
+    .proposal-list {
+      display: grid;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .proposal-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fcfdfc;
+    }
+    .proposal-card b {
+      color: var(--ink);
+    }
+    .proposal-card span {
+      color: var(--muted);
+    }
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .swatch {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      display: inline-block;
+      border: 2px solid transparent;
+      box-sizing: border-box;
+    }
+    .line-swatch {
+      width: 28px;
+      height: 0;
+      border-top: 3px solid var(--curve);
+      display: inline-block;
+    }
+    .truth-swatch {
+      border-top-color: var(--truth);
+      border-top-style: dashed;
+    }
+    #messages {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 7px;
+      font-size: 12px;
+      color: var(--ink);
+    }
+    #messages li {
+      border-left: 3px solid var(--curve);
+      padding-left: 8px;
+      color: #344154;
+    }
+    @media (max-width: 1060px) {
+      .topbar, .content {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        max-height: none;
+      }
+      canvas {
+        height: 62vh;
+      }
+    }
+  </style>
+</head>
+<body>
+<main class="app">
+  <header class="topbar">
+    <div class="title-block">
+      <h1>Drop Injection Active Learning</h1>
+      <div id="subtitle">Waiting for campaign state...</div>
+      <div id="runStateBadge" class="run-state">WAITING</div>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-meta">
+        <span id="progressLabel">0 of 0 sweeps</span>
+        <span id="batchLabel">batch size 0</span>
+      </div>
+      <div class="progress-track"><div id="progressFill"></div></div>
+    </div>
+  </header>
+  <div class="content">
+    <section class="plot-shell">
+      <div class="plot-caption">
+        <span class="caption-strong">Rr / Oh regime map</span>
+        <span>older points fade; latest sweep is emphasized</span>
+      </div>
+      <canvas id="plot" width="1100" height="720"></canvas>
+    </section>
+    <aside>
+      <div class="stats">
+        <div class="stat"><b id="iteration">0/0</b><span>Iteration</span></div>
+        <div class="stat"><b id="completed">0</b><span>Completed runs</span></div>
+        <div class="stat"><b id="drops">0</b><span>Drops</span></div>
+        <div class="stat"><b id="pending">0</b><span>Current proposals</span></div>
+      </div>
+      <div id="statusPanel" class="status-panel">
+        <b id="statusLabel">Waiting for campaign state</b>
+        <span id="statusDetail">The visualizer will mark convergence or completion here.</span>
+      </div>
+      <h2>Sweep Timeline</h2>
+      <div id="timeline" class="timeline"></div>
+      <h2>Current Proposals</h2>
+      <div id="proposalList" class="proposal-list"></div>
+      <h2>Legend</h2>
+      <div class="legend">
+        <div class="legend-row"><span class="swatch" style="background: var(--drop)"></span>Drops, id = 1</div>
+        <div class="legend-row"><span class="swatch" style="background: var(--no-drop)"></span>No-drops, id = 0</div>
+        <div class="legend-row"><span class="swatch" style="border-color: var(--proposal)"></span>Proposed next run</div>
+        <div class="legend-row"><span class="line-swatch"></span>Learned contour</div>
+        <div class="legend-row"><span class="line-swatch truth-swatch"></span>Classifier contour</div>
+      </div>
+      <h2>Process</h2>
+      <ul id="messages"></ul>
+    </aside>
+  </div>
+</main>
+<script>
+const canvas = document.getElementById("plot");
+const ctx = canvas.getContext("2d");
+let latest = null;
+const pad = { left: 78, right: 36, top: 36, bottom: 66 };
+
+function log10(v) { return Math.log(v) / Math.LN10; }
+function transform(v, scale) { return scale === "log10" ? log10(v) : v; }
+function inverseTransform(v, scale) { return scale === "log10" ? Math.pow(10, v) : v; }
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function resizeCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(720, Math.floor(rect.width * ratio));
+  canvas.height = Math.max(480, Math.floor(rect.height * ratio));
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  draw();
+}
+
+function plotArea() {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x0: pad.left,
+    y0: pad.top,
+    x1: rect.width - pad.right,
+    y1: rect.height - pad.bottom,
+  };
+}
+
+function scales(state) {
+  const area = plotArea();
+  const d = state.domain;
+  const rrLo = transform(d.rr_min, d.rr_scale || "linear");
+  const rrHi = transform(d.rr_max, d.rr_scale || "linear");
+  const ohLo = transform(d.oh_min, d.oh_scale || "log10");
+  const ohHi = transform(d.oh_max, d.oh_scale || "log10");
+  return {
+    x(rr) {
+      return area.x0 + (transform(rr, d.rr_scale || "linear") - rrLo) / (rrHi - rrLo) * (area.x1 - area.x0);
+    },
+    y(oh) {
+      return area.y1 - (transform(oh, d.oh_scale || "log10") - ohLo) / (ohHi - ohLo) * (area.y1 - area.y0);
+    },
+    area,
+  };
+}
+
+function axisTicks(minValue, maxValue, scale, targetCount = 6) {
+  if (scale === "log10") {
+    const ticks = [];
+    const startPower = Math.floor(log10(minValue));
+    const endPower = Math.ceil(log10(maxValue));
+    for (let power = startPower; power <= endPower; power++) {
+      for (const mantissa of [1, 2, 5]) {
+        const value = mantissa * Math.pow(10, power);
+        if (value >= minValue * 0.999999 && value <= maxValue * 1.000001) ticks.push(value);
+      }
+    }
+    if (!ticks.includes(maxValue)) ticks.push(maxValue);
+    return [...new Set(ticks)].sort((a, b) => a - b);
+  }
+  const ticks = [];
+  for (let i = 0; i <= targetCount; i++) {
+    ticks.push(minValue + (maxValue - minValue) * i / targetCount);
+  }
+  return ticks;
+}
+
+function formatTick(value) {
+  if (value >= 100) return value.toFixed(0);
+  if (value >= 10) return value.toFixed(value % 1 ? 1 : 0);
+  if (value >= 1) return value.toFixed(value % 1 ? 1 : 0);
+  return value.toPrecision(2).replace(/0+$/, "").replace(/\\.$/, "");
+}
+
+function drawGrid(state, s) {
+  const { area } = s;
+  const rect = canvas.getBoundingClientRect();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  ctx.fillStyle = "#fbfcfb";
+  ctx.fillRect(0, 0, rect.width, rect.height);
+  ctx.strokeStyle = "#d8e0df";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(area.x0, area.y0, area.x1 - area.x0, area.y1 - area.y0);
+
+  ctx.fillStyle = "#657385";
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const d = state.domain;
+  const xTicks = axisTicks(d.rr_min, d.rr_max, d.rr_scale || "linear", 5);
+  for (const rr of xTicks) {
+    const x = s.x(rr);
+    ctx.beginPath();
+    ctx.moveTo(x, area.y0);
+    ctx.lineTo(x, area.y1);
+    ctx.strokeStyle = rr === d.rr_min || rr === d.rr_max ? "#d8e0df" : "#edf1f4";
+    ctx.stroke();
+    ctx.fillText(formatTick(rr), x, area.y1 + 12);
+  }
+
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  const yTicks = axisTicks(d.oh_min, d.oh_max, d.oh_scale || "log10", 6);
+  for (const oh of yTicks) {
+    const y = s.y(oh);
+    ctx.beginPath();
+    ctx.moveTo(area.x0, y);
+    ctx.lineTo(area.x1, y);
+    ctx.strokeStyle = "#edf1f4";
+    ctx.stroke();
+    ctx.fillText(formatTick(oh), area.x0 - 10, y);
+  }
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillStyle = "#202933";
+  ctx.font = "13px system-ui, sans-serif";
+  ctx.fillText("Rr", (area.x0 + area.x1) / 2, area.y1 + 48);
+  ctx.save();
+  ctx.translate(20, (area.y0 + area.y1) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText(`Oh (${d.oh_scale || "linear"} scale)`, 0, 0);
+  ctx.restore();
+}
+
+function drawLine(points, s, xKey, yKey, color, width, dashed = false) {
+  const valid = points.filter(p => Number.isFinite(p[xKey]) && Number.isFinite(p[yKey]) && p[yKey] > 0);
+  if (valid.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.setLineDash(dashed ? [7, 6] : []);
+  ctx.beginPath();
+  valid.forEach((p, i) => {
+    const x = s.x(p[xKey]);
+    const y = s.y(p[yKey]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBand(points, s) {
+  const valid = points.filter(p => p.y_c_q05 > 0 && p.y_c_q95 > 0);
+  if (valid.length < 2) return;
+  ctx.save();
+  ctx.fillStyle = "rgba(46, 99, 211, 0.16)";
+  ctx.beginPath();
+  valid.forEach((p, i) => {
+    const x = s.x(p.Rr);
+    const y = s.y(p.y_c_q95);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  [...valid].reverse().forEach(p => {
+    ctx.lineTo(s.x(p.Rr), s.y(p.y_c_q05));
+  });
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function jitterFor(caseId) {
+  const text = String(caseId || "");
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  const angle = (hash % 360) * Math.PI / 180;
+  const radius = ((hash % 9) / 9) * 2.4;
+  return { dx: Math.cos(angle) * radius, dy: Math.sin(angle) * radius };
+}
+
+function drawPoints(state, s) {
+  const latestSweep = Math.max(0, ...state.completed.map(p => p.sweep || 0));
+  for (const p of state.completed) {
+    const jitter = jitterFor(p.caseId);
+    const x = s.x(p.Rr) + jitter.dx;
+    const y = s.y(p.Oh) + jitter.dy;
+    const recent = (p.sweep || 0) === latestSweep;
+    const radius = recent ? 6.2 : 3.8;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.globalAlpha = recent ? 0.96 : 0.48;
+    ctx.fillStyle = p.id === 1 ? "#0f8065" : "#c4495a";
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = recent ? 2.2 : 1.2;
+    ctx.stroke();
+  }
+  for (const p of state.proposals) {
+    const x = s.x(p.Rr);
+    const y = s.y(p.Oh);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
+    ctx.strokeStyle = "#d99a22";
+    ctx.lineWidth = 2.8;
+    ctx.fillRect(-6.5, -6.5, 13, 13);
+    ctx.strokeRect(-6.5, -6.5, 13, 13);
+    ctx.restore();
+  }
+}
+
+function drawPlotSummary(state, s) {
+  const { area } = s;
+  const drops = state.completed.filter(p => p.id === 1).length;
+  ctx.save();
+  ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+  ctx.strokeStyle = "#d8e0df";
+  ctx.lineWidth = 1;
+  const text = `${state.completed.length} completed | ${drops} drops | ${state.proposals.length} pending`;
+  ctx.font = "12px system-ui, sans-serif";
+  const width = ctx.measureText(text).width + 24;
+  ctx.beginPath();
+  ctx.roundRect(area.x1 - width - 12, area.y0 + 12, width, 30, 6);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#202933";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, area.x1 - width / 2 - 12, area.y0 + 27);
+  ctx.restore();
+}
+
+function draw() {
+  if (!latest) return;
+  const state = latest;
+  const s = scales(state);
+  drawGrid(state, s);
+  drawBand(state.contour || [], s);
+  drawLine(state.true_contour || [], s, "Rr", "Oh", "#26313d", 2, true);
+  drawPoints(state, s);
+  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#ffffff", 6.4, false);
+  drawLine(state.contour || [], s, "Rr", "y_c_pred", "#2e63d3", 3.2, false);
+  drawPlotSummary(state, s);
+}
+
+function campaignRunState(state) {
+  const total = state.total_iterations || state.iteration || 0;
+  const status = String(state.status || "").toLowerCase();
+  if (status === "converged") {
+    return {
+      kind: "converged",
+      label: "CONVERGED",
+      detail: "Stopped early because contour movement stayed below the configured tolerances.",
+    };
+  }
+  if (status === "complete") {
+    return {
+      kind: "completed",
+      label: "COMPLETED",
+      detail: "Reached the configured sweep limit. This is a completed campaign, not an early convergence stop.",
+    };
+  }
+  const progress = total ? `${state.iteration} of ${total} sweeps complete` : "campaign in progress";
+  return {
+    kind: "running",
+    label: "RUNNING - not converged yet",
+    detail: `${progress}; latest status is "${state.status || "starting"}".`,
+  };
+}
+
+function updateSidebar(state) {
+  const drops = state.completed.filter(p => p.id === 1).length;
+  const total = state.total_iterations || state.iteration || 0;
+  const pct = total ? Math.min(100, Math.round(state.iteration / total * 100)) : 0;
+  const runState = campaignRunState(state);
+  document.getElementById("subtitle").textContent = `${runState.label} | ${state.status} | updated ${state.updated_at}`;
+  const badge = document.getElementById("runStateBadge");
+  badge.textContent = runState.label;
+  badge.className = `run-state run-state-${runState.kind}`;
+  document.getElementById("statusLabel").textContent = runState.label;
+  document.getElementById("statusDetail").textContent = runState.detail;
+  document.getElementById("iteration").textContent = `${state.iteration}/${total}`;
+  document.getElementById("completed").textContent = state.completed.length;
+  document.getElementById("drops").textContent = drops;
+  document.getElementById("pending").textContent = state.proposals.length;
+  document.getElementById("progressLabel").textContent = `${state.iteration} of ${total} sweeps`;
+  document.getElementById("batchLabel").textContent = `batch size ${state.batch_size || 0}`;
+  document.getElementById("progressFill").style.width = `${pct}%`;
+
+  const timeline = document.getElementById("timeline");
+  timeline.innerHTML = "";
+  const history = (state.history || []).slice(-140);
+  if (!history.length) {
+    const empty = document.createElement("div");
+    empty.style.color = "#657385";
+    empty.style.fontSize = "12px";
+    empty.textContent = "timeline will fill as sweeps complete";
+    timeline.appendChild(empty);
+  }
+  for (const item of history) {
+    const totalRuns = Math.max(1, item.completed || 1);
+    const bar = document.createElement("div");
+    bar.className = "timeline-bar";
+    bar.title = `sweep ${item.iteration}: ${item.drops} drops, ${item.no_drops} no-drops`;
+    const drop = document.createElement("span");
+    drop.className = "timeline-drop";
+    drop.style.height = item.drops ? `${Math.max(4, item.drops / totalRuns * 100)}%` : "0";
+    const noDrop = document.createElement("span");
+    noDrop.className = "timeline-no-drop";
+    noDrop.style.height = item.no_drops ? `${Math.max(4, item.no_drops / totalRuns * 100)}%` : "0";
+    bar.appendChild(drop);
+    bar.appendChild(noDrop);
+    timeline.appendChild(bar);
+  }
+
+  const proposalList = document.getElementById("proposalList");
+  proposalList.innerHTML = "";
+  const proposals = state.proposals || [];
+  if (!proposals.length) {
+    const empty = document.createElement("div");
+    empty.className = "proposal-card";
+    empty.innerHTML = "<span>No current proposals.</span>";
+    proposalList.appendChild(empty);
+  }
+  for (const proposal of proposals.slice(0, 5)) {
+    const row = document.createElement("div");
+    row.className = "proposal-card";
+    row.innerHTML = `<b>${proposal.proposal_type}</b> <span>case ${proposal.caseId}</span><br>` +
+      `<span>Rr ${proposal.Rr.toFixed(3)}, Oh ${proposal.Oh.toPrecision(3)}, score ${proposal.score.toFixed(3)}</span>`;
+    proposalList.appendChild(row);
+  }
+
+  const messages = document.getElementById("messages");
+  messages.innerHTML = "";
+  for (const message of state.messages || []) {
+    const li = document.createElement("li");
+    li.textContent = message;
+    messages.appendChild(li);
+  }
+}
+
+async function poll() {
+  try {
+    const response = await fetch(`state.json?ts=${Date.now()}`, { cache: "no-store" });
+    if (response.ok) {
+      latest = await response.json();
+      updateSidebar(latest);
+      draw();
+    }
+  } catch (error) {
+    document.getElementById("subtitle").textContent = "Waiting for local visualizer server...";
+  } finally {
+    setTimeout(poll, 350);
+  }
+}
+
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+poll();
+</script>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+
+def start_server(output_dir: Path, port: int) -> tuple[ThreadingHTTPServer, str]:
+    handler = lambda *args, **kwargs: DirectoryHandler(  # noqa: E731
+        *args, directory=str(output_dir), **kwargs
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, actual_port = server.server_address
+    return server, f"http://{host}:{actual_port}/index.html"
+
+
+def sleep_if_requested(delay: float) -> None:
+    if delay > 0:
+        time.sleep(delay)
+
+
+def log_progress(messages: list[str], message: str) -> None:
+    stamped = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    messages.append(stamped)
+    print(stamped, flush=True)
+
+
+def run_campaign(args: argparse.Namespace) -> tuple[Path, str | None]:
+    domain = Domain(
+        rr_min=args.rr_min,
+        rr_max=args.rr_max,
+        rr_scale=args.rr_scale,
+        oh_min=args.oh_min,
+        oh_max=args.oh_max,
+        oh_scale=args.oh_scale,
+    )
+    output_dir = args.output_dir or default_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_html(output_dir)
+
+    messages: list[str] = []
+    history: list[dict[str, Any]] = []
+    true_contour = find_true_contour(
+        domain,
+        classifier=args.classifier,
+        size_tolerance=args.size_tolerance,
+    )
+    log_progress(messages, f"Writing visualization artifacts to {output_dir}.")
+    log_progress(
+        messages,
+        "Built the reference classifier contour using "
+        f"{CLASSIFIER_SCRIPTS[args.classifier].name}.",
+    )
+    update_visual_state(
+        output_dir,
+        status="starting",
+        iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
+        domain=domain,
+        completed=[],
+        proposals=[],
+        contour=[],
+        true_contour=true_contour,
+        history=history,
+        messages=messages,
+    )
+
+    server: ThreadingHTTPServer | None = None
+    url: str | None = None
+    if not args.no_server:
+        server, url = start_server(output_dir, args.port)
+        log_progress(messages, f"Serving live visualization at {url}.")
+        update_visual_state(
+            output_dir,
+            status="serving visualization",
+            iteration=0,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=[],
+            proposals=[],
+            contour=[],
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        if not args.no_browser:
+            webbrowser.open(url)
+
+    log_progress(
+        messages,
+        f"Generating and classifying {args.initial_points} initial space-filling runs.",
+    )
+    update_visual_state(
+        output_dir,
+        status="building initial design",
+        iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
+        domain=domain,
+        completed=[],
+        proposals=[],
+        contour=[],
+        true_contour=true_contour,
+        history=history,
+        messages=messages,
+    )
+    all_completed = make_initial_design(
+        args.initial_points,
+        domain,
+        args.seed,
+        classifier=args.classifier,
+        size_tolerance=args.size_tolerance,
+    )
+    completed_files: list[Path] = [output_dir / "Sweep-0_completed.csv"]
+    write_completed_sweep(completed_files[0], all_completed)
+    log_progress(messages, f"Generated and classified {len(all_completed)} initial runs.")
+    update_visual_state(
+        output_dir,
+        status="initial design complete",
+        iteration=0,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
+        domain=domain,
+        completed=all_completed,
+        proposals=[],
+        contour=[],
+        true_contour=true_contour,
+        history=history,
+        messages=messages,
+    )
+    sleep_if_requested(args.delay)
+
+    preview_contour: list[dict[str, float]] = []
+    previous_convergence_contour: list[dict[str, float]] = []
+    stable_convergence_checks = 0
+    completed_iterations = 0
+    stopped_for_convergence = False
+    for iteration in range(1, args.iterations + 1):
+        should_refresh_preview = (
+            iteration == 1
+            or iteration == args.iterations
+            or iteration % args.preview_every == 0
+        )
+        if should_refresh_preview:
+            preview_path = output_dir / f"Sweep-{iteration}_contour-preview.csv"
+            log_progress(
+                messages,
+                "Sweep "
+                f"{iteration}: refreshing learned contour preview "
+                f"({args.preview_points} points, grid {args.preview_grid_size}).",
+            )
+            update_visual_state(
+                output_dir,
+                status=f"sweep {iteration} refreshing preview",
+                iteration=iteration,
+                total_iterations=args.iterations,
+                batch_size=args.batch_size,
+                domain=domain,
+                completed=all_completed,
+                proposals=[],
+                contour=preview_contour,
+                true_contour=true_contour,
+                history=history,
+                messages=messages,
+            )
+            preview_started = time.perf_counter()
+            preview_contour = build_model_preview_contour(
+                completed_files,
+                domain,
+                points=args.preview_points,
+                grid_size=args.preview_grid_size,
+                posterior_samples=args.preview_posterior_samples,
+                transition_width=args.transition_width,
+                label_noise=args.label_noise,
+                contour_fit=args.contour_fit,
+                length_scale_x=args.length_scale_x,
+                length_scale_y=args.length_scale_y,
+                seed=args.seed + 10_000 + iteration,
+            )
+            write_preview_contour(preview_path, preview_contour)
+            log_progress(
+                messages,
+                "Sweep "
+                f"{iteration}: refreshed learned contour preview in "
+                f"{time.perf_counter() - preview_started:.1f}s.",
+            )
+            if (
+                args.convergence_rms_tolerance > 0
+                or args.convergence_max_tolerance > 0
+                or args.convergence_boundary_tolerance > 0
+            ) and (
+                previous_convergence_contour
+                and completed_iterations >= args.convergence_min_iterations
+            ):
+                metrics = contour_change_metrics(
+                    previous_convergence_contour,
+                    preview_contour,
+                    domain,
+                    args.convergence_mode,
+                    args.convergence_boundary_fraction,
+                )
+                observations, _ = sweep.read_csv_files(
+                    completed_files,
+                    case_col="caseId",
+                    x_col="Rr",
+                    y_col="Oh",
+                    label_col="id",
+                )
+                model_domain = sweep.Domain(
+                    x_min=domain.rr_min,
+                    x_max=domain.rr_max,
+                    y_min=domain.oh_min,
+                    y_max=domain.oh_max,
+                )
+                resolution = assessment.contour_resolution(
+                    sweep.aggregate_observations(observations),
+                    model_domain,
+                    model_preview_config(
+                        domain,
+                        args.preview_grid_size,
+                        0,
+                        args.transition_width,
+                        args.label_noise,
+                        args.contour_fit,
+                        args.length_scale_x,
+                        args.length_scale_y,
+                    ),
+                )
+                resolution_ready = bool(
+                    resolution["max_x_gap"] <= args.convergence_max_x_gap
+                    and resolution["max_y_bracket_width"]
+                    <= args.convergence_max_y_bracket_width
+                    and (
+                        args.convergence_allow_unbracketed_edges
+                        or all(resolution["edge_bracketed"].values())
+                    )
+                )
+                stable = False
+                if metrics is not None:
+                    stable = resolution_ready
+                    if (
+                        args.convergence_rms_tolerance > 0
+                        and metrics["rms"] > args.convergence_rms_tolerance
+                    ):
+                        stable = False
+                    if (
+                        args.convergence_max_tolerance > 0
+                        and metrics["max"] > args.convergence_max_tolerance
+                    ):
+                        stable = False
+                    if (
+                        args.convergence_boundary_tolerance > 0
+                        and metrics["boundary_max"] > args.convergence_boundary_tolerance
+                    ):
+                        stable = False
+                if stable:
+                    stable_convergence_checks += 1
+                else:
+                    stable_convergence_checks = 0
+                if metrics is not None:
+                    log_progress(
+                        messages,
+                        "Contour movement "
+                        f"rms={metrics['rms']:.3g}, max={metrics['max']:.3g}, "
+                        f"edge={metrics['boundary_max']:.3g} "
+                        f"x-gap={resolution['max_x_gap']:.3g}, "
+                        f"y-bracket={resolution['max_y_bracket_width']:.3g} "
+                        f"({stable_convergence_checks}/{args.convergence_patience}).",
+                    )
+                if stable_convergence_checks >= args.convergence_patience:
+                    stopped_for_convergence = True
+                    log_progress(
+                        messages,
+                        "Stopped early: learned contour movement stayed below "
+                        "the configured RMS, max, and boundary tolerances.",
+                    )
+                    break
+            previous_convergence_contour = list(preview_contour)
+
+        proposed_path = output_dir / f"Sweep-{iteration}_proposed.csv"
+        log_progress(
+            messages,
+            "Sweep "
+            f"{iteration}: proposing {args.batch_size} runs "
+            f"(grid {args.grid_size}, posterior samples {args.posterior_samples}).",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} proposing next batch",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=[],
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        proposal_started = time.perf_counter()
+        proposal_rows = run_proposal(
+            completed_files,
+            proposed_path,
+            domain,
+            n_simulations=args.batch_size,
+            seed=args.seed + iteration,
+            grid_size=args.grid_size,
+            posterior_samples=args.posterior_samples,
+            transition_width=args.transition_width,
+            label_noise=args.label_noise,
+            contour_fit=args.contour_fit,
+            length_scale_x=args.length_scale_x,
+            length_scale_y=args.length_scale_y,
+            scarcity_fraction=args.scarcity_fraction,
+            scarcity_candidate_bins=args.scarcity_candidate_bins,
+            scarcity_fan_width=args.scarcity_fan_width,
+            n_new=args.n_new,
+            n_repeats=args.n_repeats,
+        )
+        proposals = [proposal_from_row(row) for row in proposal_rows]
+
+        new_proposals = sum(1 for proposal in proposals if proposal.proposal_type == "new")
+        repeat_proposals = len(proposals) - new_proposals
+        log_progress(
+            messages,
+            f"Sweep {iteration}: proposed {new_proposals} new and "
+            f"{repeat_proposals} repeat runs in {time.perf_counter() - proposal_started:.1f}s.",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} proposed",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=proposals,
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        sleep_if_requested(args.delay)
+
+        newly_completed: list[CompletedRun] = []
+        log_progress(
+            messages,
+            f"Sweep {iteration}: running {len(proposal_rows)} simulated experiments "
+            f"with {args.classifier} classifier.",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} running experiments",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=proposals,
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        progress_interval = max(1, min(16, len(proposal_rows) // 4 or 1))
+        for run_index, row in enumerate(proposal_rows, start=1):
+            run = proposal_rows_to_completed(
+                [row],
+                iteration,
+                classifier=args.classifier,
+                size_tolerance=args.size_tolerance,
+            )[0]
+            newly_completed.append(run)
+            all_completed.append(run)
+            if (
+                run_index == 1
+                or run_index == len(proposal_rows)
+                or run_index % progress_interval == 0
+            ):
+                log_progress(
+                    messages,
+                    f"Sweep {iteration}: ran {run_index}/{len(proposal_rows)} cases; "
+                    f"latest case {run.case_id} id={run.label}.",
+                )
+            remaining_case_ids = {done.case_id for done in newly_completed}
+            update_visual_state(
+                output_dir,
+                status=f"sweep {iteration} running experiments",
+                iteration=iteration,
+                total_iterations=args.iterations,
+                batch_size=args.batch_size,
+                domain=domain,
+                completed=all_completed,
+                proposals=[
+                    proposal
+                    for proposal in proposals
+                    if proposal.case_id not in remaining_case_ids
+                ],
+                contour=preview_contour,
+                true_contour=true_contour,
+                history=history,
+                messages=messages,
+            )
+            sleep_if_requested(args.delay / 2)
+
+        completed_path = output_dir / f"Sweep-{iteration}_completed.csv"
+        completed_files.append(completed_path)
+        write_completed_sweep(completed_path, newly_completed)
+        sweep_drops = sum(run.label for run in newly_completed)
+        sweep_no_drops = len(newly_completed) - sweep_drops
+        mean_score = (
+            sum(proposal.score for proposal in proposals) / len(proposals)
+            if proposals
+            else 0.0
+        )
+        history.append(
+            {
+                "iteration": iteration,
+                "completed": len(newly_completed),
+                "drops": sweep_drops,
+                "no_drops": sweep_no_drops,
+                "new": new_proposals,
+                "repeat": repeat_proposals,
+                "mean_score": mean_score,
+            }
+        )
+        log_progress(
+            messages,
+            f"Sweep {iteration}: observed {sweep_drops} drops and {sweep_no_drops} no-drops.",
+        )
+        update_visual_state(
+            output_dir,
+            status=f"sweep {iteration} complete",
+            iteration=iteration,
+            total_iterations=args.iterations,
+            batch_size=args.batch_size,
+            domain=domain,
+            completed=all_completed,
+            proposals=[],
+            contour=preview_contour,
+            true_contour=true_contour,
+            history=history,
+            messages=messages,
+        )
+        completed_iterations = iteration
+        sleep_if_requested(args.delay)
+
+    # Always rebuild after the last completed batch. Pre-sweep previews are
+    # intentionally cheap, but reusing one here would omit the campaign's
+    # final observations from the reported contour.
+    preview_contour = build_model_preview_contour(
+        completed_files,
+        domain,
+        points=args.preview_points,
+        grid_size=args.preview_grid_size,
+        posterior_samples=args.preview_posterior_samples,
+        transition_width=args.transition_width,
+        label_noise=args.label_noise,
+        contour_fit=args.contour_fit,
+        length_scale_x=args.length_scale_x,
+        length_scale_y=args.length_scale_y,
+        seed=args.seed + 20_000 + completed_iterations,
+    )
+    write_preview_contour(
+        output_dir / f"Sweep-{completed_iterations}_contour-final.csv",
+        preview_contour,
+    )
+    log_progress(messages, "Refreshed the final contour from all completed runs.")
+
+    log_progress(
+        messages,
+        (
+            "Campaign stopped after contour convergence."
+            if stopped_for_convergence
+            else "Campaign complete."
+        ),
+    )
+    update_visual_state(
+        output_dir,
+        status="converged" if stopped_for_convergence else "complete",
+        iteration=completed_iterations,
+        total_iterations=args.iterations,
+        batch_size=args.batch_size,
+        domain=domain,
+        completed=all_completed,
+        proposals=[],
+        contour=preview_contour,
+        true_contour=true_contour,
+        history=history,
+        messages=messages,
+    )
+
+    if server and not args.no_hold and sys.stdin.isatty():
+        input("Press Enter to stop the local visualization server...")
+        server.shutdown()
+    return output_dir, url
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        validate_args(args)
+        output_dir, url = run_campaign(args)
+    except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote visualization artifacts to {output_dir}")
+    if url:
+        print(f"Live visualization URL: {url}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
