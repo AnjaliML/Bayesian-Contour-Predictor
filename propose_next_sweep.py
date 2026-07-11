@@ -87,6 +87,7 @@ class ModelConfig:
     scarcity_fraction: float = 0.125
     scarcity_candidate_bins: int = 12
     scarcity_fan_width: float = 0.08
+    allowed_x_values: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,27 @@ def inverse_transformed_value(value: float, scale: str) -> float:
     if scale == "linear":
         return value
     return 10**value
+
+
+def x_is_allowed(value: float, config: ModelConfig) -> bool:
+    if not config.allowed_x_values:
+        return True
+    return any(
+        math.isclose(value, candidate, rel_tol=1e-12, abs_tol=1e-12)
+        for candidate in config.allowed_x_values
+    )
+
+
+def nearest_allowed_x(value: float, config: ModelConfig) -> float:
+    if not config.allowed_x_values:
+        return value
+    value_t = transformed_value(value, config.x_scale, "x")
+    return min(
+        config.allowed_x_values,
+        key=lambda candidate: abs(
+            transformed_value(candidate, config.x_scale, "x") - value_t
+        ),
+    )
 
 
 def transformed_x(value: float, config: ModelConfig) -> float:
@@ -889,6 +911,18 @@ def scarcity_anchor_x_values(
         return []
     bin_count = max(config.scarcity_candidate_bins, 1)
     counts = x_bin_anchor_counts(aggregates, domain, config, bin_count)
+
+    if config.allowed_x_values:
+        ranked = sorted(
+            config.allowed_x_values,
+            key=lambda x: (
+                counts[x_bin_index(x, domain, config, bin_count)],
+                -x_gap_score(x, aggregates, domain, config),
+                rng.random(),
+            ),
+        )
+        return ranked[:count]
+
     lower = transformed_value(domain.x_min, config.x_scale, "x")
     upper = transformed_value(domain.x_max, config.x_scale, "x")
     span = max(upper - lower, 1e-12)
@@ -1349,6 +1383,8 @@ def propose_repeats(
     proposals: list[Proposal] = []
     contour_cache: dict[float, ContourEstimate] = {}
     for point in repeat_candidate_points(aggregates, count, domain, config):
+        if not x_is_allowed(point.x, config):
+            continue
         if point.x not in contour_cache:
             contour_cache[point.x] = contour_estimate(point.x, aggregates, domain, config, rng)
         contour = contour_cache[point.x]
@@ -1396,6 +1432,8 @@ def propose_repeats(
 def candidate_x_values(
     domain: Domain, aggregates: Sequence[AggregatePoint], config: ModelConfig, count: int
 ) -> list[float]:
+    if config.allowed_x_values:
+        return list(config.allowed_x_values)
     lower = transformed_value(domain.x_min, config.x_scale, "x")
     upper = transformed_value(domain.x_max, config.x_scale, "x")
     base = [inverse_transformed_value(value, config.x_scale) for value in linspace(lower, upper, count)]
@@ -1610,7 +1648,12 @@ def x_candidates_for_y_level(
         )
 
     if candidates:
-        return sorted(set(candidates))
+        return sorted(
+            {
+                nearest_allowed_x(candidate, config)
+                for candidate in candidates
+            }
+        )
 
     nearest_x, _ = min(
         ordered,
@@ -1618,7 +1661,7 @@ def x_candidates_for_y_level(
             transformed_value(item[1].y_c_pred, config.y_scale, "y") - y_t
         ),
     )
-    return [nearest_x]
+    return [nearest_allowed_x(nearest_x, config)]
 
 
 def propose_new_points(
@@ -1654,6 +1697,8 @@ def propose_new_points(
         vertical_probe: float,
         bracket_gap: float = 0.0,
     ) -> None:
+        if not x_is_allowed(x, config):
+            return
         n_existing, _ = exact_existing_counts(x, y, aggregates_by_coord)
         if n_existing:
             return
@@ -1934,6 +1979,38 @@ def write_rows(rows: Sequence[dict[str, str]], outfile: Path | None, *, legacy: 
         writer.writerows(rows)
 
 
+def parse_x_candidates(value: str | None) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    raw_values = [item.strip() for item in value.split(",") if item.strip()]
+    if not raw_values:
+        raise ValueError("--x-candidates must contain at least one numeric value")
+    candidates: list[float] = []
+    for raw_value in raw_values:
+        try:
+            candidate = float(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"--x-candidates contains non-numeric value {raw_value!r}"
+            ) from exc
+        if not math.isfinite(candidate):
+            raise ValueError("--x-candidates values must be finite")
+        candidates.append(candidate)
+    return tuple(sorted(set(candidates)))
+
+
+def validate_x_candidates(
+    candidates: Sequence[float], domain: Domain, x_scale: str
+) -> None:
+    for candidate in candidates:
+        if candidate < domain.x_min or candidate > domain.x_max:
+            raise ValueError(
+                f"--x-candidates value {candidate:g} is outside "
+                f"[{domain.x_min:g}, {domain.x_max:g}]"
+            )
+        transformed_value(candidate, x_scale, "x")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Propose the next batch for noisy 2-D binary contour learning."
@@ -1967,6 +2044,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--x-scale", choices=["linear", "log10"], default="linear")
     parser.add_argument("--y-scale", choices=["linear", "log10"], default="linear")
+    parser.add_argument(
+        "--x-candidates",
+        help="Comma-separated allow-list for every proposed x value.",
+    )
     parser.add_argument("--transition-width", type=float, default=0.10)
     parser.add_argument("--label-noise", type=float, default=0.02)
     parser.add_argument("--length-scale-x", type=float)
@@ -2041,6 +2122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             y_max=args.y_max,
         )
         validate_domain_scales(domain, args)
+        allowed_x_values = parse_x_candidates(args.x_candidates)
+        validate_x_candidates(allowed_x_values, domain, args.x_scale)
         config = ModelConfig(
             mode=args.mode,
             monotone_direction=args.monotone_direction,
@@ -2064,6 +2147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scarcity_fraction=args.scarcity_fraction,
             scarcity_candidate_bins=args.scarcity_candidate_bins,
             scarcity_fan_width=args.scarcity_fan_width,
+            allowed_x_values=allowed_x_values,
         )
         proposals = propose_next_batch(
             observations,

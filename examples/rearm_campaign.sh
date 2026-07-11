@@ -17,6 +17,8 @@ Y_MIN="${Y_MIN:-0.001}"
 Y_MAX="${Y_MAX:-0.1}"
 X_SCALE="${X_SCALE:-log10}"
 Y_SCALE="${Y_SCALE:-log10}"
+# Optional comma-separated allow-list, for example: 1,1.5,2,3,4,6,8,10,13,16
+X_CANDIDATES="${X_CANDIDATES:-}"
 
 mkdir -p "${CAMPAIGN_DIR}/contours" "${CAMPAIGN_DIR}/proposals" "${CAMPAIGN_DIR}/completed"
 if [[ ! -f "${CAMPAIGN_DIR}/completed/Sweep-0_completed.csv" ]]; then
@@ -42,6 +44,10 @@ MODEL_ARGS=(
   --scarcity-candidate-bins 12
   --scarcity-fan-width 0.08
 )
+PROPOSAL_ARGS=()
+if [[ -n "${X_CANDIDATES}" ]]; then
+  PROPOSAL_ARGS+=(--x-candidates "${X_CANDIDATES}")
+fi
 
 last_completed="$(python3 -c 'import glob,re,sys; values=[int(m.group(1)) for p in glob.glob(sys.argv[1] + "/completed/Sweep-*_completed.csv") if (m := re.search(r"Sweep-(\d+)_completed\.csv$", p))]; print(max(values, default=0))' "${CAMPAIGN_DIR}")"
 
@@ -74,7 +80,8 @@ for ((iteration = last_completed + 1; iteration <= MAX_ITERATIONS; iteration++))
     --n-new "${BATCH_SIZE}" \
     --n-repeats 0 \
     --seed "$((SEED + iteration))" \
-    "${MODEL_ARGS[@]}"
+    "${MODEL_ARGS[@]}" \
+    "${PROPOSAL_ARGS[@]}"
 
   # Contract: adapter INPUT_PROPOSALS.csv OUTPUT_COMPLETED.csv
   # The adapter may fan out through a scheduler, but must preserve caseId,x,y
