@@ -5,9 +5,9 @@
 seed = 11
 classifier = binary
 size_tolerance = 0.005
-iterations = 20
+iterations = 32
 initial_points = 24
-batch_size = 8
+batch_size = 16
 n_new = auto
 n_repeats = 0
 
@@ -23,7 +23,7 @@ oh_scale = log10
 # posterior_samples = 0 is the fast interactive visualizer setting.
 # Increase it when uncertainty bands matter more than run speed.
 grid_size = 21
-posterior_samples = 0
+posterior_samples = 2
 transition_width = 0.04
 label_noise = 0.005
 contour_fit = local-linear
