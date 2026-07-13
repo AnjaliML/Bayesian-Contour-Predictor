@@ -200,6 +200,103 @@ class ProposeNextSweepTests(unittest.TestCase):
             self.assertNotIn("Rr", rows[0])
             self.assertNotIn("Oh", rows[0])
 
+    def test_cli_restricts_all_proposals_to_explicit_x_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self.write_csv(
+                directory,
+                "sweep.csv",
+                "\n".join(
+                    [
+                        "caseId,x,y,id",
+                        "1,1,0.004,1",
+                        "2,1,0.04,0",
+                        "3,4,0.01,1",
+                        "4,4,0.05,0",
+                        "5,16,0.02,1",
+                        "6,16,0.08,0",
+                    ]
+                ),
+            )
+            out = Path(directory) / "next.csv"
+            allowed = {1.0, 2.0, 4.0, 8.0, 16.0}
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(data),
+                    "--outfile",
+                    str(out),
+                    "--mode",
+                    "monotone-y",
+                    "--x-scale",
+                    "log10",
+                    "--y-scale",
+                    "log10",
+                    "--x-min",
+                    "1",
+                    "--x-max",
+                    "16",
+                    "--y-min",
+                    "0.001",
+                    "--y-max",
+                    "0.1",
+                    "--x-candidates",
+                    "1,2,4,8,16",
+                    "--n-simulations",
+                    "8",
+                    "--n-new",
+                    "6",
+                    "--n-repeats",
+                    "2",
+                    "--grid-size",
+                    "9",
+                    "--posterior-samples",
+                    "0",
+                    "--seed",
+                    "7",
+                ],
+                check=True,
+            )
+
+            rows = self.read_rows(out)
+            self.assertEqual(len(rows), 8)
+            self.assertLessEqual({float(row["x"]) for row in rows}, allowed)
+            self.assertEqual(sum(row["proposal_type"] == "repeat" for row in rows), 2)
+
+    def test_cli_rejects_x_candidate_outside_domain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self.write_csv(
+                directory,
+                "sweep.csv",
+                "\n".join(
+                    [
+                        "caseId,x,y,id",
+                        "1,1,0.2,1",
+                        "2,4,0.8,0",
+                    ]
+                ),
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(data),
+                    "--x-min",
+                    "1",
+                    "--x-max",
+                    "4",
+                    "--x-candidates",
+                    "1,8",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("outside [1, 4]", result.stderr)
+
     def test_monotone_decreasing_probability_falls_as_y_increases(self):
         low_y = sweep.monotone_probability(
             0.02,

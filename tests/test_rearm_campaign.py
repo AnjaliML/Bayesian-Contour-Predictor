@@ -51,6 +51,7 @@ with open(sys.argv[1], newline='') as source, open(sys.argv[2], 'w', newline='')
                 "BATCH_RUNNER": str(runner),
                 "BATCH_SIZE": "2",
                 "MAX_ITERATIONS": "1",
+                "X_CANDIDATES": "1,100",
             }
 
             subprocess.run(["bash", str(SCRIPT)], check=True, env=environment, capture_output=True)
@@ -70,6 +71,7 @@ with open(sys.argv[1], newline='') as source, open(sys.argv[2], 'w', newline='')
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 2)
             self.assertLessEqual({row["id"] for row in rows}, {"0", "1"})
+            self.assertLessEqual({float(row["x"]) for row in rows}, {1.0, 100.0})
 
 
 if __name__ == "__main__":

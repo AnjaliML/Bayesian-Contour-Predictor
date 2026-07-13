@@ -118,6 +118,24 @@ are enabled. For new coordinates, it also bisects observed `id = 1` / `id = 0`
 brackets and stratifies selections across the `x` range so one dense region
 does not consume the whole batch.
 
+## Constrained X Coordinates
+
+Use a comma-separated allow-list when the experiment runner cannot accept
+arbitrary `x` values:
+
+```bash
+python3 propose_next_sweep.py Sweep-0.csv \
+  --x-min 1 --x-max 16 \
+  --x-scale log10 \
+  --x-candidates 1,1.5,2,3,4,6,8,10,13,16 \
+  --n-simulations 16
+```
+
+The proposal engine evaluates and scores the allowed coordinates directly;
+it does not round a continuous proposal after acquisition. Repeats are also
+restricted, so any `--n-repeats` budget requires completed observations at
+allowed `x` values.
+
 ## Stopping
 
 Common stopping checks:

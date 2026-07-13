@@ -37,6 +37,21 @@ python3 propose_next_sweep.py examples/drop_injection_seed.csv \
   --seed 11
 ```
 
+If the simulator supports only selected `x` values, constrain every proposal
+to an explicit allow-list:
+
+```bash
+python3 propose_next_sweep.py examples/drop_injection_seed.csv \
+  --x-col Rr --y-col Oh \
+  --mode monotone-y --x-scale log10 --y-scale log10 \
+  --x-min 1 --x-max 16 --y-min 0.001 --y-max 0.1 \
+  --x-candidates 1,1.5,2,3,4,6,8,10,13,16 \
+  --n-simulations 16 --n-new 16 --n-repeats 0
+```
+
+The allow-list applies to new coordinates and requested repeats. Values must
+be finite, inside the configured `x` bounds, and positive under `log10` scale.
+
 The output rows are proposed experiments with `id = -1`. Replace each `-1`
 with the observed `0` or `1`, append the rows to the campaign data, and rerun
 the script for the next sweep.
@@ -72,6 +87,9 @@ and set `BATCH_RUNNER` to an adapter that consumes proposed `x,y` rows and write
 completed `id` values. `assess_contour.py` stores a generic contour, transformed
 SSE movement, bracket coverage, and a `refining`, `stalled`, or `converged`
 state without access to a theoretical answer.
+
+For the rearmable loop, set the same constraint through
+`X_CANDIDATES=1,1.5,2,3,4,6,8,10,13,16`.
 
 The parameter comparison is reproducible with:
 
